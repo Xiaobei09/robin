@@ -1,6 +1,6 @@
 name: "Robin"
-description: "Free AI code reviews for every PR. BYOK, works with OpenRouter free tier. Auto-reviews on open, /robin or /review on demand. No quotas."
-author: "antongulin"
+description: "Custom Robin action for Silicon mod code review. Based on antongulin/robin."
+author: "Xiaobei09"
 branding:
   icon: "feather"
   color: "green"
