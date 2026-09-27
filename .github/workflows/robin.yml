@@ -55,7 +55,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Robin review
-        uses: antongulin/robin@v2.7.2
+        uses: Xiaobei09/robin@main
         with:
           github-token: ${{ github.token }}
           llm-api-key: ${{ secrets.LLM_API_KEY }}
