@@ -1,0 +1,82 @@
+name: "Robin"
+description: "Free AI code reviews for every PR. BYOK, works with OpenRouter free tier. Auto-reviews on open, /robin or /review on demand. No quotas."
+author: "antongulin"
+branding:
+  icon: "feather"
+  color: "green"
+
+inputs:
+  github-token:
+    description: "GitHub token for posting PR review comments"
+    required: true
+    default: "${{ github.token }}"
+  llm-api-key:
+    description: "API key for your LLM endpoint. Use \"ollama\" for self-hosted Ollama."
+    required: false
+    default: "ollama"
+  llm-base-url:
+    description: "Base URL for OpenAI-compatible API. Examples: https://api.openai.com/v1, http://your-server:11434/v1"
+    required: true
+  model:
+    description: "Model name to use. Examples: gpt-4o, llama3.2, codellama:13b, or your provider-specific model name."
+    required: true
+  fail-on-high:
+    description: "If true, the action will fail when high severity issues are found."
+    required: false
+    default: "false"
+  request-changes:
+    description: "Whether a high severity finding submits a blocking REQUEST_CHANGES review. true posts REQUEST_CHANGES; false always posts a non-blocking COMMENT (advisor mode). Leave empty to use the repo config, which defaults to true."
+    required: false
+    default: ""
+  max-diff-size:
+    description: "Maximum diff size in characters to send to the model. Large diffs are truncated."
+    required: false
+    default: "50000"
+  max-output-tokens:
+    description: "Optional maximum tokens for the LLM response. Leave empty to use the provider/model default."
+    required: false
+    default: ""
+  reasoning-effort:
+    description: "Optional reasoning effort using the OpenRouter-style reasoning object, for providers/models that accept it (for example low, medium, high, xhigh, or max). Leave empty to omit reasoning configuration entirely or to defer to .github/robin.yml; unsupported or invalid values retry once with no reasoning override and leave a status warning."
+    required: false
+    default: ""
+  llm-timeout-ms:
+    description: "Timeout in milliseconds for LLM requests. Default is 10 minutes (600000 ms). Increase if you frequently see 'Request timed out' with large diffs."
+    required: false
+    default: "600000"
+  llm-temperature:
+    description: "Sampling temperature for LLM requests, between 0 and 2. Default is 0.1 for near-deterministic reviews. Some models only accept a fixed value (for example Kimi requires 1)."
+    required: false
+    default: "0.1"
+  max-comments:
+    description: "Maximum number of inline review comments to post. Extra findings stay in the review body."
+    required: false
+    default: "15"
+  review-on-synchronize:
+    description: "Run automatic reviews for pull_request synchronize events, which happen after each new commit pushed to a PR. Set to true only if you want review on every push."
+    required: false
+    default: "false"
+  min-command-permission:
+    description: "Minimum repository permission required to run slash commands: read, triage, write, maintain, or admin."
+    required: false
+    default: "write"
+  review-instructions:
+    description: "Additional reviewer instructions appended to the built-in review prompt."
+    required: false
+    default: ""
+  review-instructions-file:
+    description: "Repository file containing additional reviewer instructions. Read from the PR base branch for safety."
+    required: false
+    default: ".github/code-reviewer.md"
+  config-file:
+    description: "Optional repository config file on the PR base branch (.github/robin.yml)."
+    required: false
+    default: ".github/robin.yml"
+  use-json-response-mode:
+    description: "Request JSON object responses when the provider supports response_format. Leave empty to use repo config or default true."
+    required: false
+    default: ""
+
+runs:
+  using: "node24"
+  main: "dist/index.js"
