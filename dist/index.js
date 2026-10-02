@@ -778,7 +778,9 @@ class LLMClient {
                 core.warning(`LLM attempt ${attempt}/${this.maxAttempts} failed: ${error}`);
                 if (!(0, llm_retry_1.isRetriableLlmError)(error, this.retryContext()) || attempt === this.maxAttempts) {
                     core.error(`LLM API error: ${error}`);
-                    throw new Error(`Failed to get response from LLM: ${error}`);
+                    // 保留 cause：包装后 status 与完整错误链会丢，
+                    // 上层要靠它判断「是不是出口瞬时故障、该不该换个 CI 继续审查」。
+                    throw new Error(`Failed to get response from LLM: ${error}`, { cause: error });
                 }
             }
             if (attempt < this.maxAttempts) {
@@ -789,10 +791,18 @@ class LLMClient {
                 await (0, llm_retry_1.delayMs)(waitMs);
             }
         }
-        if (lastError && (0, llm_retry_1.isRetriableLlmError)(lastError, this.retryContext())) {
+        // 只看 lastError 是否存在，不再重算 isRetriableLlmError：
+        // 能走到这里说明所有 attempt 都没在 catch 里抛出（:143 已经把不可重试的
+        // 错误抛出去了），所以 lastError 必然是可重试的那个。重算谓词既冗余，
+        // 又会在谓词日后变得依赖运行时状态时把真实的 API 错误误报成
+        // 「空响应」——那会让上层连"要不要换 CI"都判错。
+        if (lastError) {
             core.error(`LLM API error after ${this.maxAttempts} attempts: ${lastError}`);
-            throw new Error(`Failed to get response from LLM after ${this.maxAttempts} attempts: ${lastError}`);
+            throw new Error(`Failed to get response from LLM after ${this.maxAttempts} attempts: ${lastError}`, { cause: lastError });
         }
+        // 这里**故意不挂 cause**：走到这个分支意味着每次 attempt 都正常返回了
+        // HTTP 响应、只是正文为空（finish_reason 记在消息里），根本没有底层
+        // 异常可挂。硬造一个 cause 只会污染错误链、误导上层分类器。
         throw new Error(`Empty response from LLM after ${this.maxAttempts} attempts (finish_reason=${lastFinishReason})`);
     }
     /**
@@ -972,6 +982,8 @@ exports.isUnsupportedReasoningEffortError = isUnsupportedReasoningEffortError;
 exports.isInvalidReasoningEffortError = isInvalidReasoningEffortError;
 exports.errorTextChain = errorTextChain;
 exports.isRetriableLlmError = isRetriableLlmError;
+exports.isPermanentEgressFailure = isPermanentEgressFailure;
+exports.isTransientEgressFailure = isTransientEgressFailure;
 exports.shouldUseJsonResponseMode = shouldUseJsonResponseMode;
 exports.computeRetryDelayMs = computeRetryDelayMs;
 exports.getLlmCompletionAttemptCount = getLlmCompletionAttemptCount;
@@ -1150,15 +1162,18 @@ function isRetriableLlmError(error, context = {}) {
     if (!error)
         return false;
     const routerModel = isOpenRouterRouterModel(context.model);
-    if (typeof error === "object" && error !== null && "status" in error) {
-        const status = Number(error.status);
-        if (status === 429 || (Number.isFinite(status) && status >= 500)) {
+    // 统一走 llmErrorStatus：它会沿 cause 链找 status。早先这里内联了一份
+    // 「只看顶层 status」的读取，与 isPermanentEgressFailure 各写各的，结果两边
+    // 在真实调用路径（错误已被 llm-client 包装）上都读不到 provider 的状态码。
+    const status = llmErrorStatus(error);
+    if (status !== undefined) {
+        if (status === 429 || status >= 500) {
             return true;
         }
         if (status === 404 && routerModel) {
             return true;
         }
-        if (Number.isFinite(status) && status >= 400 && status < 500) {
+        if (status >= 400 && status < 500) {
             return false;
         }
     }
@@ -1186,6 +1201,97 @@ function isRetriableLlmError(error, context = {}) {
         message.includes("enetunreach") ||
         message.includes("epipe") ||
         message.includes("und_err"));
+}
+/**
+ * 永久性出口故障的特征词。
+ *
+ * 与 `isRetriableLlmError` 刻意分开：那个谓词管「同一次 run 内还要不要再试一次」，
+ * 成本只是几次 attempt，所以对「域名写错」这类错误也宽容。这个谓词管
+ * 「要不要抛弃这个 CI、另起一个新 CI」—— 成本是整条流水线，绝不能被永久性配置错误
+ * 触发，否则配错一次 base-url 就会变成无限重启 CI。
+ */
+const PERMANENT_EGRESS_KEYWORDS = [
+    // DNS 明确报「主机不存在」：域名写错或该主机已下线，换几次 runner 都不会变。
+    // 注意必须与瞬时的 eai_again（DNS 暂时失败）区分开，两者都是 getaddrinfo 家族。
+    "enotfound",
+    "und_err_invalid_url",
+    "invalid_api_key",
+    "incorrect api key",
+    "unauthorized",
+    "forbidden",
+    "model_not_found",
+    "unknown model",
+    "no such model",
+    "does not support",
+];
+/**
+ * 这些 4xx 看着像「客户端错误」，实际却是**瞬时**的。
+ *
+ * 429 限流尤其关键：它是最该「换个 CI（换 IP/换 runner）重试」的典型场景，
+ * 绝不能被当成「换几次都没用的配置错误」—— 那会让换出口这个功能在最需要时失灵。
+ * 408 是服务端等请求等超时，同理。
+ */
+const TRANSIENT_CLIENT_STATUSES = new Set([408, 429]);
+/**
+ * 取出错误链上的 HTTP 状态码；没有就返回 undefined（连接层错误没有 status）。
+ *
+ * **必须沿 cause 链往上找**。调用方（`main.ts` 的 catch）拿到的是
+ * `llm-client.ts` 包装过的错误，真正的 provider 错误挂在 `cause` 上、
+ * `status` 也只挂在那一层。只看顶层的话，生产路径上 `status` 恒为 undefined，
+ * 下面所有按状态码分类的规则（429/408 瞬时、4xx 永久、5xx 可重试）全部是死代码 ——
+ * 而单测直接喂原始错误，恰好把这个洞盖住了（R926）。
+ *
+ * 遍历方式与 `errorTextChain` 一致：限深 + 防环。
+ */
+function llmErrorStatus(error) {
+    const seen = new Set();
+    let current = error;
+    for (let depth = 0; depth < MAX_ERROR_CAUSE_DEPTH && current != null; depth++) {
+        if (typeof current === "object" || typeof current === "function") {
+            if (seen.has(current))
+                break;
+            seen.add(current);
+        }
+        if (typeof current === "object" && "status" in current) {
+            const status = Number(current.status);
+            if (Number.isFinite(status))
+                return status;
+        }
+        current = current.cause;
+    }
+    return undefined;
+}
+/**
+ * 这个错误是否「换一个 CI run 也不会变好」。
+ *
+ * 命中即表示：不该拿它去触发重新跑一个 CI。
+ */
+function isPermanentEgressFailure(error, context = {}) {
+    if (!error)
+        return false;
+    const routerModel = isOpenRouterRouterModel(context.model);
+    const status = llmErrorStatus(error);
+    if (status !== undefined && status >= 400 && status < 500) {
+        if (TRANSIENT_CLIENT_STATUSES.has(status))
+            return false;
+        // OpenRouter 路由模型报 404 是「这个后端暂时没这个模型」，路由会换后端，属瞬时。
+        if (!(status === 404 && routerModel))
+            return true;
+    }
+    const message = errorTextChain(error);
+    return PERMANENT_EGRESS_KEYWORDS.some((keyword) => message.includes(keyword));
+}
+/**
+ * 出口是否处于**瞬时**故障：值得抛弃当前 CI、另起一个新 CI 继续审查。
+ *
+ * 必须同时满足「可重试」（确实是故障，不是配置错）与「非永久」
+ * （换个 run 有机会好）。注意它与 `isRetriableLlmError` 是**两个独立决策**，
+ * 后者更宽松，前者更严格。
+ */
+function isTransientEgressFailure(error, context = {}) {
+    if (!isRetriableLlmError(error, context))
+        return false;
+    return !isPermanentEgressFailure(error, context);
 }
 function shouldUseJsonResponseMode(attempt, jsonResponseMode) {
     return jsonResponseMode && attempt === 1;
@@ -1275,6 +1381,7 @@ const diff_annotate_1 = __nccwpck_require__(4523);
 const repo_config_1 = __nccwpck_require__(2800);
 const review_prompts_1 = __nccwpck_require__(319);
 const commands_1 = __nccwpck_require__(367);
+const relaunch_1 = __nccwpck_require__(2388);
 async function run() {
     let octokit;
     let statusOwner = "";
@@ -1283,6 +1390,13 @@ async function run() {
     let statusCommand = "review";
     let statusModel = "not configured";
     let onJobCancelled;
+    // 「换出口」用得到的东西必须在 try 外面：决定重启的动作恰恰发生在 catch 里，
+    // 而 catch 只能看到 run() 作用域的变量。prNumber 原本是 try 内部的 let，
+    // 提到这里跟着 statusOwner/statusRepo 走。
+    let statusPrNumber;
+    let relaunchEnabled = false;
+    let maxRelaunches = 0;
+    let llmModel = "";
     try {
         const eventName = github.context.eventName;
         const payload = github.context.payload;
@@ -1344,9 +1458,15 @@ async function run() {
             core.info("No matching trigger found. Skipping.");
             return;
         }
+        statusPrNumber = prNumber;
+        // 「换出口」的两个开关在这里读一次：输入可能非法/缺失，解析成确定值后
+        // 存到外层，catch 里不必再解析、也不会在错误路径上抛新的异常。
+        relaunchEnabled = (0, relaunch_1.resolveRelaunchOnEgressFailure)(core.getInput("llm-relaunch-on-egress-failure"));
+        maxRelaunches = (0, relaunch_1.resolveMaxRelaunches)(core.getInput("llm-max-relaunches"));
         const apiKey = core.getInput("llm-api-key") || "ollama";
         const baseUrl = core.getInput("llm-base-url") || "";
         const model = core.getInput("model") || "";
+        llmModel = model;
         const failOnHigh = core.getInput("fail-on-high") === "true";
         const maxDiffSizeInput = core.getInput("max-diff-size") || "50000";
         const maxCommentsInput = core.getInput("max-comments") || "25";
@@ -1496,11 +1616,90 @@ async function run() {
         if (octokit && statusOwner && statusRepo && statusCommentId) {
             await updateStatusComment(octokit, statusOwner, statusRepo, statusCommentId, buildFailedStatusBody(message, statusCommand));
         }
+        // 「换出口」放在失败状态评论之后：先让这一轮的结论落进评论（新 run 会继承），
+        // 再决定要不要另起一个 CI。反过来的话，新 run 继承到的就是一条还没写完的评论。
+        const relaunched = octokit && statusPrNumber
+            ? await maybeRelaunchOnEgressFailure({
+                octokit,
+                owner: statusOwner,
+                repo: statusRepo,
+                prNumber: statusPrNumber,
+                error,
+                enabled: relaunchEnabled,
+                maxRelaunches,
+                model: llmModel,
+            })
+            : false;
+        // 已经发起重启的，这次 run 就该以失败告终：新 run 由
+        // `concurrency: cancel-in-progress` 把当前 run 取消掉，状态评论
+        // 会被认成 superseded，所以这里仍然照常 setFailed。
         core.setFailed(message);
+        if (relaunched) {
+            core.info("已发起换 CI；本次 run 将被新 run 取代。");
+        }
     }
     finally {
         onJobCancelled = undefined;
     }
+}
+/**
+ * 出口被 opencode 之类的网关阻断时：放弃当前 run，发一条 `/robin` 评论
+ * 让消费方 workflow 起一个新 run（换 runner = 换出口），并把上一轮的
+ * 评论继承过去。
+ *
+ * **永不抛出**。这一步的任何失败（列表评论 403、发评论 429、解析炸了……）
+ * 都只记 warning —— 它发生在错误路径上，抛出去会把「真正的失败原因」顶掉，
+ * 让人只看到一个无关紧要的 secondary failure。返回 true 表示评论已发出。
+ */
+async function maybeRelaunchOnEgressFailure(input) {
+    try {
+        const commentBodies = await listIssueCommentBodies(input.octokit, input.owner, input.repo, input.prNumber);
+        const plan = (0, relaunch_1.planRelaunch)({
+            enabled: input.enabled,
+            error: input.error,
+            commentBodies,
+            maxRelaunches: input.maxRelaunches,
+            model: input.model,
+        });
+        if (!plan.shouldPost || !plan.body) {
+            core.info(`不换出口：${plan.reason}`);
+            return false;
+        }
+        await input.octokit.rest.issues.createComment({
+            owner: input.owner,
+            repo: input.repo,
+            issue_number: input.prNumber,
+            body: plan.body,
+        });
+        core.info(plan.reason);
+        return true;
+    }
+    catch (relaunchError) {
+        core.warning(`换出口失败，退回为普通失败：${relaunchError instanceof Error ? relaunchError.message : String(relaunchError)}`);
+        return false;
+    }
+}
+/**
+ * 列出 PR 上的全部评论正文，供 readPreviousHop 读回上一跳。
+ *
+ * 和 findLatestStatusComment 一样是 best-effort：列不出来就当没有历史
+ * （hop 0），这是安全的一侧 —— 最坏结果是多重启一次，而不是不重启。
+ */
+async function listIssueCommentBodies(octokit, owner, repo, issueNumber) {
+    const listComments = octokit?.rest?.issues?.listComments;
+    if (typeof octokit?.paginate !== "function" || !listComments)
+        return [];
+    const comments = await octokit.paginate(listComments, {
+        owner,
+        repo,
+        issue_number: issueNumber,
+        per_page: 100,
+    });
+    if (!Array.isArray(comments))
+        return [];
+    return comments
+        .map((comment) => comment?.body)
+        .filter((body) => typeof body === "string");
 }
 async function addEyesReaction(octokit, owner, repo, commentId) {
     if (!commentId)
@@ -1976,6 +2175,181 @@ function buildReasoningFallbackNotice(reason) {
         "or the workflow `with: reasoning-effort` value.");
 }
 //# sourceMappingURL=reasoning-fallback.js.map
+
+/***/ }),
+
+/***/ 2388:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+/**
+ * 「换出口」= 抛弃当前 CI，另起一个新 CI 继续审查。
+ *
+ * 为什么必须是新 CI 而不是同一次 run 内换个 baseUrl 重试：审查跑在一个
+ * **zengate gateway** 之后（消费方 workflow 的 Install/Start/Smoke-test 三步），
+ * gateway 自己被阻断时，同一次 run 里无论换什么 URL 都还是走同一个坏掉的出口。
+ * 唯一有效的办法是换一个 runner —— 也就是让 CI 重新跑一次。
+ *
+ * 怎么让 CI 重新跑：发一条以 `/robin` 开头的 PR 评论。消费方 workflow 的
+ * `issue_comment` 触发器会因此起一个**新 run**，而 workflow 上的
+ * `concurrency: { group: robin-<pr>, cancel-in-progress: true }` 会把当前这个
+ * run 取消掉 —— 正好就是「抛弃原来那个 CI」。
+ *
+ * 两个约束必须守住，否则这个功能会变成一台绞肉机：
+ *
+ * 1. **评论正文必须以 `/robin` 或 `/review` 开头**。消费方的 job 守卫用的是
+ *    `startsWith(github.event.comment.body, ...)`，所以前面不能有 emoji、
+ *    空白或不可见标记。下面的 `RELAUNCH_COMMAND` 独立成常量就是为了让这条
+ *    约束在测试里能被钉住。
+ * 2. **必须有 hop 上限**。出口持续坏掉时每一轮都会想重启，没有上限就是
+ *    无限重启 CI、把维护者的配额烧光。hop 计数通过评论正文本身传递，
+ *    不依赖任何外部存储，所以新 run 读回自己的上一跳即可。
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.DEFAULT_RELAUNCH_ON_EGRESS_FAILURE = exports.DEFAULT_MAX_RELAUNCHES = exports.RELAUNCH_MARKER = exports.RELAUNCH_COMMAND = void 0;
+exports.resolveMaxRelaunches = resolveMaxRelaunches;
+exports.resolveRelaunchOnEgressFailure = resolveRelaunchOnEgressFailure;
+exports.readPreviousHop = readPreviousHop;
+exports.decideRelaunch = decideRelaunch;
+exports.buildRelaunchCommentBody = buildRelaunchCommentBody;
+exports.planRelaunch = planRelaunch;
+const llm_retry_1 = __nccwpck_require__(4069);
+/** 触发新 CI 的命令前缀。必须是整个正文的开头，见上方约束 1。 */
+exports.RELAUNCH_COMMAND = "/robin";
+/** 机器可读标记：新 run 靠它认出「这是上一次自己发的重启评论」并取回 hop。 */
+exports.RELAUNCH_MARKER = "<!-- robin:relaunch -->";
+/** 一次审查最多因为出口故障重启几次。0 表示彻底关闭这个行为。 */
+exports.DEFAULT_MAX_RELAUNCHES = 2;
+/** 默认开启：出口被阻断时换一个 CI 继续，正是这个 action 存在的意义。 */
+exports.DEFAULT_RELAUNCH_ON_EGRESS_FAILURE = true;
+function resolveMaxRelaunches(raw) {
+    if (raw === undefined || raw === null || String(raw).trim() === "") {
+        return exports.DEFAULT_MAX_RELAUNCHES;
+    }
+    const parsed = Number(String(raw).trim());
+    // 非数字（用户笔误）：用文档化默认值，从宽。
+    if (!Number.isFinite(parsed))
+        return exports.DEFAULT_MAX_RELAUNCHES;
+    // 数字但越界（负数/小数）：**夹到 0**，也就是彻底关掉重启。
+    // 这里必须 fail closed 而不是 fail open —— 把 "-1" 悄悄当成"允许重启 2 次"
+    // 会让这道护栏朝更松的方向失效，正是它本该防住的事故。
+    return Math.max(0, Math.floor(parsed));
+}
+function resolveRelaunchOnEgressFailure(raw) {
+    if (raw === undefined || raw === null || String(raw).trim() === "") {
+        return exports.DEFAULT_RELAUNCH_ON_EGRESS_FAILURE;
+    }
+    return !/^(false|0|no|off)$/i.test(String(raw).trim());
+}
+/**
+ * 从已发评论里取回上一次重启用掉的 hop 数。
+ *
+ * 扫**最后**一次出现：一轮接一轮会在正文里叠出多条 `hop=`，取最新的那个才对。
+ * 没有标记说明还没重启过（hop 0）。
+ */
+function readPreviousHop(commentBodies) {
+    let hop = 0;
+    for (const body of commentBodies) {
+        if (typeof body !== "string")
+            continue;
+        if (!body.includes(exports.RELAUNCH_MARKER))
+            continue;
+        const match = body.match(/hop=(\d+)/);
+        if (!match)
+            continue;
+        const parsed = Number(match[1]);
+        if (Number.isFinite(parsed) && parsed > hop)
+            hop = parsed;
+    }
+    return hop;
+}
+/**
+ * 决定这一轮要不要发重启评论。
+ *
+ * 三个条件同时成立才发：行为开着、错误确属瞬时出口故障、hop 还没用完。
+ * 缺任何一个都应当正常失败 —— 静默不重启比盲目重启安全。
+ */
+function decideRelaunch(input) {
+    if (!input.enabled) {
+        return { shouldRelaunch: false, reason: "换出口已被输入关闭" };
+    }
+    if (!input.isTransientEgress) {
+        // 永久性错误（域名写错、key 无效、模型不存在）换几次 CI 都不会变好，
+        // 必须老老实实失败，否则配错一次配置就会被无限重启。
+        return { shouldRelaunch: false, reason: "非瞬时出口故障，换 CI 也不会变好" };
+    }
+    if (input.previousHop >= input.maxRelaunches) {
+        return {
+            shouldRelaunch: false,
+            reason: `已重启 ${input.previousHop} 次，达到上限 ${input.maxRelaunches}`,
+        };
+    }
+    const hop = input.previousHop + 1;
+    return {
+        shouldRelaunch: true,
+        hop,
+        reason: `出口瞬时故障（${input.errorText}），发起第 ${hop}/${input.maxRelaunches} 次换 CI`,
+    };
+}
+/**
+ * 重启评论正文。
+ *
+ * `RELAUNCH_COMMAND` 必须在最前面（消费方守卫用 startsWith），其后才是标记与
+ * 人类可读部分。
+ */
+function buildRelaunchCommentBody(input) {
+    return [
+        exports.RELAUNCH_COMMAND,
+        "",
+        exports.RELAUNCH_MARKER,
+        `hop=${input.hop} of ${input.maxRelaunches}`,
+        "",
+        `🔁 出口故障，放弃本次 CI 并换一个 CI 继续审查（第 ${input.hop}/${input.maxRelaunches} 次）。`,
+        "",
+        "**原因**（瞬时出口故障，换一个 runner 有机会恢复）：",
+        "",
+        "```",
+        input.errorText,
+        "```",
+        "",
+        `若连续 ${input.maxRelaunches} 次仍失败，说明不是瞬时问题，需要检查 gateway 与 LLM 出口配置。`,
+        "",
+        "<sub>本评论由 robin 自动发出，用于触发新的 CI run。上一轮的结论已由状态评论继承。</sub>",
+    ].join("\n");
+}
+/**
+ * 把「读历史 hop → 判要不要重启 → 生成正文」串成一步，main.ts 只负责取评论和发评论。
+ *
+ * 放在这里而不是 main.ts，是因为这一整步是纯函数：没有 octokit、没有 IO，
+ * 因此「永久错误不重启」「额度用完不重启」这两条安全约束可以被单测钉住，
+ * 而不用去跑整条流水线。
+ */
+function planRelaunch(input) {
+    const isTransientEgress = (0, llm_retry_1.isTransientEgressFailure)(input.error, { model: input.model });
+    const errorText = input.errorText || (0, llm_retry_1.errorMessage)(input.error);
+    const decision = decideRelaunch({
+        enabled: input.enabled,
+        isTransientEgress,
+        previousHop: readPreviousHop(input.commentBodies),
+        maxRelaunches: input.maxRelaunches,
+        errorText,
+    });
+    if (!decision.shouldRelaunch || decision.hop === undefined) {
+        return { shouldPost: false, reason: decision.reason };
+    }
+    return {
+        shouldPost: true,
+        hop: decision.hop,
+        reason: decision.reason,
+        body: buildRelaunchCommentBody({
+            hop: decision.hop,
+            maxRelaunches: input.maxRelaunches,
+            errorText,
+        }),
+    };
+}
+//# sourceMappingURL=relaunch.js.map
 
 /***/ }),
 
