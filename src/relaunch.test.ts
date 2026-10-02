@@ -1,6 +1,7 @@
 import {
   buildRelaunchCommentBody,
   decideRelaunch,
+  isGithubActionsToken,
   planRelaunch,
   readPreviousHop,
   RELAUNCH_COMMAND,
@@ -210,6 +211,86 @@ describe("换出口 = 抛弃当前 CI，另起一个新 CI（R922）", () => {
       expect(plan.shouldPost).toBe(true);
       expect(plan.hop).toBe(1);
       expect(plan.body?.startsWith(RELAUNCH_COMMAND)).toBe(true);
+    });
+  });
+
+  // R933：GITHUB_TOKEN 发的评论不会触发新 workflow run ⇒ 换 CI 根本不会发生。
+  // 判据必须钉住「前缀」这件事本身，否则把 startsWith 换成 includes 也能过。
+  describe("isGithubActionsToken（这条评论到底能不能起新 CI）", () => {
+    it("ghs_ 前缀（GITHUB_TOKEN / GitHub App 安装令牌）= 发出去也白发", () => {
+      expect(isGithubActionsToken("ghs_abcdefghijklmnop")).toBe(true);
+      expect(isGithubActionsToken("  ghs_abcdefghijklmnop  ")).toBe(true);
+    });
+
+    it("PAT 前缀 = 真的会起新 run，必须放行", () => {
+      expect(isGithubActionsToken("ghp_classicPATvalue1234567")).toBe(false);
+      expect(isGithubActionsToken("github_pat_11ABCDEFG0fineGrained")).toBe(false);
+      // 判别性用例：PAT 字符串里同时含有 "ghs_"（经典 PAT 随机段完全可能撞上
+      // 这三个字符）。没有这行的话，把 PAT 豁免整行删掉测试仍然全绿（M2 变异
+      // 存活），而生产上会把所有 PAT 误判成 GITHUB_TOKEN、把关掉换 CI ——
+      // 也就是恰好把「唯一能用的那批用户」杀掉。
+      expect(isGithubActionsToken("ghp_aaaSECREThs_zzz1234567")).toBe(false);
+    });
+
+    it("拿不到 / 认不出的 token 一律按「不是 GITHUB_TOKEN」处理（未知不等于不能用）", () => {
+      expect(isGithubActionsToken(undefined)).toBe(false);
+      expect(isGithubActionsToken(null)).toBe(false);
+      expect(isGithubActionsToken("")).toBe(false);
+      expect(isGithubActionsToken("   ")).toBe(false);
+      expect(isGithubActionsToken("some-opaque-token")).toBe(false);
+    });
+
+    it("反向：不能说 ghp_/github_pat_ 也被当成 GITHUB_TOKEN（否则换 CI 被误杀）", () => {
+      // 这条与上面两条是同一判据的两面：startsWith 换成 includes 会让
+      // isGithubActionsToken("prefix_ghs_xxx") 变 true 而仍然「看起来合理」，
+      // 所以额外钉一条「含 ghs_ 但不是前缀」必须是 false。
+      expect(isGithubActionsToken("prefix_ghs_notarealtoken")).toBe(false);
+      expect(isGithubActionsToken("xghs_leading")).toBe(false);
+    });
+
+    // R933 的关键一条：**判据必须落在真正被调用的那条路径上**。
+    // 只测 isGithubActionsToken 而不测 planRelaunch 是不够的 —— M5 变异
+    // （把 main.ts 里的守卫短路掉）全绿，说明闸门建在了一条没人走的路上。
+    // 所以这里钉的是 planRelaunch 本身：给定 GITHUB_TOKEN 就不该产出评论。
+    it("接线：planRelaunch 拿到 GITHUB_TOKEN 时**不发评论**（M5 变异要能抓住）", () => {
+      const transient = Object.assign(new Error("fetch failed"), { code: "ECONNRESET" });
+      const plan = planRelaunch({
+        enabled: true,
+        error: transient,
+        commentBodies: [],
+        maxRelaunches: 2,
+        model: "big-pickle",
+        githubToken: "ghs_abcdefghijklmnop",
+      });
+      expect(plan.shouldPost).toBe(false);
+      expect(plan.body).toBeUndefined();
+      expect(plan.reason).toContain("GITHUB_TOKEN");
+      expect(plan.reason).toContain("workflow_dispatch");
+    });
+
+    it("接线：PAT 时照常发评论（别把唯一有效的通道一起关掉）", () => {
+      const transient = Object.assign(new Error("fetch failed"), { code: "ECONNRESET" });
+      const plan = planRelaunch({
+        enabled: true,
+        error: transient,
+        commentBodies: [],
+        maxRelaunches: 2,
+        githubToken: "ghp_classicPATvalue1234567",
+      });
+      expect(plan.shouldPost).toBe(true);
+      expect(plan.hop).toBe(1);
+      expect(plan.body?.startsWith(RELAUNCH_COMMAND)).toBe(true);
+    });
+
+    it("接线：不传 githubToken 时维持原行为（不能因为新增参数就静默关功能）", () => {
+      const transient = Object.assign(new Error("fetch failed"), { code: "ECONNRESET" });
+      const plan = planRelaunch({
+        enabled: true,
+        error: transient,
+        commentBodies: [],
+        maxRelaunches: 2,
+      });
+      expect(plan.shouldPost).toBe(true);
     });
   });
 });

@@ -37,6 +37,7 @@ import {
 import { getReviewPrompt, getSummaryPrompt, getHelpMessage } from "./prompts/review-prompts";
 import { ReviewerCommand, hasRequiredPermission, parseSlashCommand } from "./commands";
 import {
+  isGithubActionsToken,
   planRelaunch,
   resolveMaxRelaunches,
   resolveRelaunchOnEgressFailure,
@@ -57,12 +58,16 @@ async function run(): Promise<void> {
   let relaunchEnabled = false;
   let maxRelaunches = 0;
   let llmModel = "";
+  // 同理：github-token 也是在 catch 里要用到的（判断这条重启评论能不能起新 CI），
+  // 必须跟着上面几个变量一起提到 try 外面，否则 catch 里引用不到。
+  let relaunchGithubToken = "";
 
   try {
     const eventName = github.context.eventName;
     const payload = github.context.payload;
     const token = core.getInput("github-token", { required: true });
     octokit = github.getOctokit(token);
+    relaunchGithubToken = token;
     const minCommandPermission = core.getInput("min-command-permission") || "write";
     const reviewOnSynchronize = core.getBooleanInput("review-on-synchronize");
 
@@ -428,6 +433,7 @@ async function run(): Promise<void> {
                   enabled: relaunchEnabled,
                   maxRelaunches,
                   model: llmModel,
+                  githubToken: relaunchGithubToken,
                 })
               : false;
           core.setFailed(msg);
@@ -476,6 +482,7 @@ async function run(): Promise<void> {
             enabled: relaunchEnabled,
             maxRelaunches,
             model: llmModel,
+            githubToken: relaunchGithubToken,
           })
         : false;
     // 已经发起重启的，这次 run 就该以失败告终：新 run 由
@@ -508,6 +515,8 @@ async function maybeRelaunchOnEgressFailure(input: {
   enabled: boolean;
   maxRelaunches: number;
   model: string;
+  /** 用来判断这条评论到底能不能起新 CI；见 isGithubActionsToken。 */
+  githubToken?: string;
 }): Promise<boolean> {
   try {
     const commentBodies = await listIssueCommentBodies(
@@ -522,9 +531,16 @@ async function maybeRelaunchOnEgressFailure(input: {
       commentBodies,
       maxRelaunches: input.maxRelaunches,
       model: input.model,
+      githubToken: input.githubToken,
     });
     if (!plan.shouldPost || !plan.body) {
-      core.info(`不换出口：${plan.reason}`);
+      // 「发了也起不了新 CI」不是普通的信息，是消费方配错了凭据 ——
+      // 用 warning 级别，让它在日志里能被一眼看见（info 会被淹在长日志里）。
+      if (isGithubActionsToken(input.githubToken)) {
+        core.warning(`不换出口：${plan.reason}`);
+      } else {
+        core.info(`不换出口：${plan.reason}`);
+      }
       return false;
     }
     await input.octokit.rest.issues.createComment({
