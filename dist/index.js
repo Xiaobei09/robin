@@ -1558,8 +1558,14 @@ async function run() {
         const model = core.getInput("model") || "";
         llmModel = model;
         const failOnHigh = core.getInput("fail-on-high") === "true";
-        const maxDiffSizeInput = core.getInput("max-diff-size") || "50000";
-        const maxCommentsInput = core.getInput("max-comments") || "25";
+        // 这两个兜底值是**哨兵**，不是「随便一个默认值」：resolveMaxComments /
+        // resolveMaxDiffSize 靠「解析结果是否等于默认常量」来判断调用方是否真的没传，
+        // 只有这时才让 .github/robin.yml 赢（review.yml 里那句 "omitted must stay
+        // unset" 说的就是这件事）。所以它们必须与 action.yml / review.yml 的 default
+        // 逐字相等 —— 写成字面量就等于把同一份真相复制一份，改一处忘另一处，哨兵静默
+        // 失效：.github/robin.yml 被无声忽略，且没有任何报错。
+        const maxDiffSizeInput = core.getInput("max-diff-size") || String(repo_config_1.DEFAULT_ACTION_MAX_DIFF_SIZE);
+        const maxCommentsInput = core.getInput("max-comments") || String(repo_config_1.DEFAULT_MAX_COMMENTS);
         const maxOutputTokensInput = core.getInput("max-output-tokens") || "";
         const maxOutputTokens = maxOutputTokensInput ? parseInt(maxOutputTokensInput, 10) : undefined;
         const reasoningEffortInput = core.getInput("reasoning-effort") || "";
