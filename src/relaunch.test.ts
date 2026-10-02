@@ -195,5 +195,21 @@ describe("换出口 = 抛弃当前 CI，另起一个新 CI（R922）", () => {
       expect(plan.shouldPost).toBe(false);
       expect(plan.reason).toContain("已被输入关闭");
     });
+
+    it("R927：模型解析失败（两次无 JSON）同样触发换 CI", () => {
+      const parseErr = new Error(
+        "empty response from llm: review unparsable after retry (no JSON object found)"
+      );
+      const plan = planRelaunch({
+        enabled: true,
+        error: parseErr,
+        commentBodies: [],
+        maxRelaunches: 2,
+        model: "big-pickle",
+      });
+      expect(plan.shouldPost).toBe(true);
+      expect(plan.hop).toBe(1);
+      expect(plan.body?.startsWith(RELAUNCH_COMMAND)).toBe(true);
+    });
   });
 });
