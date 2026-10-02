@@ -1437,6 +1437,7 @@ const review_parser_1 = __nccwpck_require__(2141);
 const review_retry_1 = __nccwpck_require__(450);
 const github_reviewer_1 = __nccwpck_require__(268);
 const status_comment_1 = __nccwpck_require__(3523);
+const llm_retry_1 = __nccwpck_require__(4069);
 const config_1 = __nccwpck_require__(4008);
 const diff_filter_1 = __nccwpck_require__(7561);
 const diff_annotate_1 = __nccwpck_require__(4523);
@@ -1607,7 +1608,7 @@ async function run() {
         const diff = await gitUtils.getPullRequestDiff(owner, repo, prNumber);
         if (!diff || diff.trim().length === 0) {
             core.warning("No diff found for this PR.");
-            await updateStatusComment(octokit, owner, repo, statusCommentId, buildFailedStatusBody("No diff found for this pull request.", statusCommand));
+            await updateStatusComment(octokit, owner, repo, statusCommentId, (0, status_comment_1.buildFailedStatusBody)("No diff found for this pull request.", statusCommand));
             return;
         }
         const diffFiles = (0, diff_filter_1.splitDiffIntoFiles)(diff);
@@ -1623,7 +1624,7 @@ async function run() {
         const reviewDiff = filteredDiff.trim() ? filteredDiff : diff;
         if (!reviewDiff.trim()) {
             core.warning("No reviewable diff remained after filtering skipped paths.");
-            await updateStatusComment(octokit, owner, repo, statusCommentId, buildFailedStatusBody("No reviewable diff remained after filtering skipped paths.", statusCommand));
+            await updateStatusComment(octokit, owner, repo, statusCommentId, (0, status_comment_1.buildFailedStatusBody)("No reviewable diff remained after filtering skipped paths.", statusCommand));
             return;
         }
         const truncatedDiff = reviewDiff.length > maxDiffSize
@@ -1677,7 +1678,7 @@ async function run() {
                 if (count === 0 && !parsedReview.usedJson) {
                     const parseErr = new Error("empty response from llm: review unparsable after retry (no JSON object found)");
                     const msg = parseErr.message;
-                    await updateStatusComment(octokit, owner, repo, statusCommentId, buildFailedStatusBody(msg, statusCommand));
+                    await updateStatusComment(octokit, owner, repo, statusCommentId, (0, status_comment_1.buildFailedStatusBody)(msg, statusCommand));
                     const relaunchedParse = octokit && statusPrNumber
                         ? await maybeRelaunchOnEgressFailure({
                             octokit,
@@ -1710,9 +1711,17 @@ async function run() {
         core.info("Done.");
     }
     catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        // 这里必须走 errorMessage()，不能就地写 `error instanceof Error ? error.message : String(error)`：
+        // 那条内联三元对空 message 会原样返回空串，于是失败评论里出现一个空的
+        // `Reason:` 行（生产实证 SiliconMod/Silicon#67，run 36585231278）。
+        // errorMessage() 兜空、并把 octokit 只写在壳里的原因（response.data.message）取出来。
+        //
+        // 注意这里只改「给人看的文本」。换 CI 的判定走的是下面传给 maybeRelaunchOnEgressFailure
+        // 的原始 `error`（planRelaunch 内部自己分类，不收 errorText），
+        // 所以永久性错误的 fail-closed 完全不受影响。
+        const message = (0, llm_retry_1.errorMessage)(error);
         if (octokit && statusOwner && statusRepo && statusCommentId) {
-            await updateStatusComment(octokit, statusOwner, statusRepo, statusCommentId, buildFailedStatusBody(message, statusCommand));
+            await updateStatusComment(octokit, statusOwner, statusRepo, statusCommentId, (0, status_comment_1.buildFailedStatusBody)(message, statusCommand));
         }
         // 「换出口」放在失败状态评论之后：先让这一轮的结论落进评论（新 run 会继承），
         // 再决定要不要另起一个 CI。反过来的话，新 run 继承到的就是一条还没写完的评论。
@@ -1912,17 +1921,6 @@ function buildSkippedFilterStatusBody(removedFiles) {
         `Skipped: ${preview}${suffix}`,
         "",
         "Add `skip-paths` in `.github/robin.yml` if that's not what you expected.",
-    ].join("\n");
-}
-function buildFailedStatusBody(errorMessage, command) {
-    return [
-        "## " + github_reviewer_1.ROBIN_SIGNATURE,
-        "",
-        `:warning: I couldn't finish the ${command === "summary" ? "summary" : "review"} this time.`,
-        "",
-        `Reason: ${errorMessage}`,
-        "",
-        "Free model routes drop sometimes — comment `/robin` to try again. (No secrets are included in this message.)",
     ].join("\n");
 }
 function buildProgressStatusBody(detail, command, model) {
@@ -3040,7 +3038,7 @@ function shouldRetryStructuredReview(findings, usedJson) {
 /***/ }),
 
 /***/ 3523:
-/***/ ((__unused_webpack_module, exports) => {
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
 
@@ -3063,12 +3061,40 @@ function shouldRetryStructuredReview(findings, usedJson) {
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.LAST_RESULT_PREFIX = exports.STATUS_COMMENT_MARKER = void 0;
+exports.buildFailedStatusBody = buildFailedStatusBody;
 exports.decorateStatusCommentBody = decorateStatusCommentBody;
 exports.extractInheritedVerdict = extractInheritedVerdict;
 exports.buildInitialStatusBody = buildInitialStatusBody;
 exports.findLatestStatusComment = findLatestStatusComment;
+const github_reviewer_1 = __nccwpck_require__(268);
 /** Invisible marker that identifies a comment as Robin's status comment (never the review). */
 exports.STATUS_COMMENT_MARKER = "<!-- robin:status -->";
+/**
+ * 失败状态评论的正文。
+ *
+ * **为什么从 `main.ts` 搬出来。** 它原来在 `main.ts` 里是模块私有函数，而
+ * `main.ts` 一被 import 就整个 `run()` 起来，所以这类函数永远拿不到测试 ——
+ * 于是只能测旁边那个「长得像」的 helper。R941 的教训正出在这里：生产上
+ * `Reason:` 是空的，那一轮的修复却打在了一个**这条路径根本没调用**的
+ * `errorMessage` 上，8 条断言 3 个变异全绿，线上 bug 原封不动。
+ *
+ * **为什么在渲染点还兜一次底。** 上游 `errorMessage()` 已经对空 message 兜底，
+ * 这里再兜一次是刻意的冗余：空 Reason 恰恰出现在最需要解释的那次失败上，
+ * 而「多写一个常量」的成本是零。将来新增调用点忘了上游兜底，也不会退化回
+ * 生产上那条什么都不说的评论。
+ */
+function buildFailedStatusBody(reason, command) {
+    const text = typeof reason === "string" ? reason.trim() : "";
+    return [
+        "## " + github_reviewer_1.ROBIN_SIGNATURE,
+        "",
+        `:warning: I couldn't finish the ${command === "summary" ? "summary" : "review"} this time.`,
+        "",
+        `Reason: ${text || "unknown error (no message)"}`,
+        "",
+        "Free model routes drop sometimes — comment `/robin` to try again. (No secrets are included in this message.)",
+    ].join("\n");
+}
 /** Prefix of the line that carries the previous run's verdict forward. */
 exports.LAST_RESULT_PREFIX = "> **Last result:** ";
 /** Append the invisible marker to a status body. Idempotent. */
