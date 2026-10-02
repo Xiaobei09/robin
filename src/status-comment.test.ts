@@ -300,5 +300,50 @@ describe("失败评论的 Reason：绝不为空，也必须说清真正原因", 
       // 也不该把人类可读文本重包成新 Error 再传（那正是 M17 干的事）
       expect(callSite).not.toMatch(/new Error\(\s*message\s*\)/);
     });
+
+    /**
+     * R944：两个状态评论写入点都必须经过 `decorateStatusCommentBody`。
+     *
+     * marker 缺失的后果不是「少个看不见的东西」，而是**整条收养链断掉**：
+     * `findLatestStatusComment` 只认带 marker 的评论，一旦某条状态评论没戴 marker，
+     * 下一轮就看不见它、于是**新建**一条而不是更新它 —— 这正是 status-comment.ts
+     * 开头要解决的「评论堆积」，而且退化时完全无声：评论照发，只是越攒越多。
+     *
+     * 生产实证：SiliconMod/Silicon#67 的失败评论 `id=5892637288`（2026-09-29）
+     * `has_marker=false`。已核实成因是 `ac3113c`（2026-10-02）才引入 marker 与收养，
+     * 那条评论早于它 ⇒ 属预期历史行为、不是现存缺陷；但守卫本身当时没有任何断言，
+     * 将来加一条新的写入路径就可能悄悄退化回去 —— 所以钉在这里。
+     *
+     * 断言用函数切片而不是全文件搜索：装饰逻辑只在写入点附近，搜全文会被
+     * `decorateStatusCommentBody` 的 import 行本身命中而恒真（R941 的教训）。
+     */
+    const sliceOf = (from: string, to: string): string =>
+      code.slice(code.indexOf(from), code.indexOf(to));
+
+    //
+    // 判据必须是「`body:` 的**值**就是装饰调用」，不能只是「函数体里出现过这个标识符」。
+    // M29（把装饰改写成一条丢弃结果的死调用：`decorateStatusCommentBody(body);` 之后
+    // 仍然 `body,` 原样发出）在弱断言下**存活**了 —— 而那正是线上真实发生的坏行为：
+    // 评论确实没戴 marker，收养链断掉。
+    // 这与 R937 的 M17、上一轮 R943 的脆弱断言同族：**搜标识符 ≠ 钉住接线**。
+    const bodyValueIsDecorated = (src: string): boolean => {
+      // 匹配 `body: decorateStatusCommentBody(` 或 `body: decorateStatusCommentBody(x)`
+      const wrapped = /body:\s*decorateStatusCommentBody\s*\(/.test(src);
+      // 多行写法：body: decorateStatusCommentBody( ... )
+      const wrappedMultiline = /body:[^,\n]*\bdecorateStatusCommentBody\s*\(/.test(src);
+      return wrapped || wrappedMultiline;
+    };
+
+    it("新建状态评论（postStatusComment）的 body 值经过 decorateStatusCommentBody", () => {
+      const seg = sliceOf("async function postStatusComment", "async function updateStatusComment");
+      expect(seg).toContain("createComment");
+      expect(bodyValueIsDecorated(seg)).toBe(true);
+    });
+
+    it("更新状态评论（updateStatusComment）的 body 值经过 decorateStatusCommentBody", () => {
+      const seg = sliceOf("async function updateStatusComment", "async function resolveStatusCommentId");
+      expect(seg).toContain("updateComment");
+      expect(bodyValueIsDecorated(seg)).toBe(true);
+    });
   });
 });
