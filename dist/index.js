@@ -1397,11 +1397,15 @@ async function run() {
     let relaunchEnabled = false;
     let maxRelaunches = 0;
     let llmModel = "";
+    // 同理：github-token 也是在 catch 里要用到的（判断这条重启评论能不能起新 CI），
+    // 必须跟着上面几个变量一起提到 try 外面，否则 catch 里引用不到。
+    let relaunchGithubToken = "";
     try {
         const eventName = github.context.eventName;
         const payload = github.context.payload;
         const token = core.getInput("github-token", { required: true });
         octokit = github.getOctokit(token);
+        relaunchGithubToken = token;
         const minCommandPermission = core.getInput("min-command-permission") || "write";
         const reviewOnSynchronize = core.getBooleanInput("review-on-synchronize");
         core.info(`Event: ${eventName}`);
@@ -1622,6 +1626,7 @@ async function run() {
                             enabled: relaunchEnabled,
                             maxRelaunches,
                             model: llmModel,
+                            githubToken: relaunchGithubToken,
                         })
                         : false;
                     core.setFailed(msg);
@@ -1659,6 +1664,7 @@ async function run() {
                 enabled: relaunchEnabled,
                 maxRelaunches,
                 model: llmModel,
+                githubToken: relaunchGithubToken,
             })
             : false;
         // 已经发起重启的，这次 run 就该以失败告终：新 run 由
@@ -1691,9 +1697,17 @@ async function maybeRelaunchOnEgressFailure(input) {
             commentBodies,
             maxRelaunches: input.maxRelaunches,
             model: input.model,
+            githubToken: input.githubToken,
         });
         if (!plan.shouldPost || !plan.body) {
-            core.info(`不换出口：${plan.reason}`);
+            // 「发了也起不了新 CI」不是普通的信息，是消费方配错了凭据 ——
+            // 用 warning 级别，让它在日志里能被一眼看见（info 会被淹在长日志里）。
+            if ((0, relaunch_1.isGithubActionsToken)(input.githubToken)) {
+                core.warning(`不换出口：${plan.reason}`);
+            }
+            else {
+                core.info(`不换出口：${plan.reason}`);
+            }
             return false;
         }
         await input.octokit.rest.issues.createComment({
@@ -2244,6 +2258,7 @@ exports.resolveRelaunchOnEgressFailure = resolveRelaunchOnEgressFailure;
 exports.readPreviousHop = readPreviousHop;
 exports.decideRelaunch = decideRelaunch;
 exports.buildRelaunchCommentBody = buildRelaunchCommentBody;
+exports.isGithubActionsToken = isGithubActionsToken;
 exports.planRelaunch = planRelaunch;
 const llm_retry_1 = __nccwpck_require__(4069);
 /** 触发新 CI 的命令前缀。必须是整个正文的开头，见上方约束 1。 */
@@ -2350,6 +2365,39 @@ function buildRelaunchCommentBody(input) {
     ].join("\n");
 }
 /**
+ * 这条重启评论**能不能真的起一个新 CI**？
+ *
+ * GitHub 有一条防递归规则：用仓库自带的 `GITHUB_TOKEN`（消费方通常写
+ * `github-token: ${{ github.token }}`）创建的事件**不会**触发新的 workflow run，
+ * 官方列出的例外只有 `workflow_dispatch` 与 `repository_dispatch`。
+ * `issue_comment` 不在例外里 ⇒ 一条由 GITHUB_TOKEN 发的 `/robin` 评论
+ * **永远不会**产生新 run。
+ *
+ * 生产实测（SiliconMod/Silicon，全仓 1287 个 run + 6 个 PR 的全部评论，
+ * 见账本 R933）：human 评论 64/64 都产生了 `issue_comment` run，
+ * `github-actions[bot]` 的评论 0/25；且用「必然被 job-if 拒掉的人类散文评论」
+ * 做对照，22/22 都留下了 skipped run —— 证明「没有 run」是因为事件没产生，
+ * 而不是被 job-if 拒掉。
+ *
+ * 所以在发评论**之前**就要认清这一点：识别出 GITHUB_TOKEN 时，
+ * 不发评论、不声称换 CI，直接把这个事实连同替代方案报给用户。
+ *
+ * 识别方式：GITHUB_TOKEN 的值一律以 `ghs_` 开头（GitHub App 安装令牌前缀），
+ * 而个人访问令牌是 `ghp_`（classic）或 `github_pat_`（fine-grained）。
+ * 判据只做前缀匹配、拿不到 token 时按「未知」处理 —— **未知不等于不能用**，
+ * 未知时维持原行为（发评论），因为本函数无权断言别人的 token 一定被抑制。
+ */
+function isGithubActionsToken(token) {
+    if (typeof token !== "string")
+        return false;
+    const trimmed = token.trim();
+    if (!trimmed)
+        return false;
+    if (trimmed.startsWith("ghp_") || trimmed.startsWith("github_pat_"))
+        return false;
+    return trimmed.startsWith("ghs_");
+}
+/**
  * 把「读历史 hop → 判要不要重启 → 生成正文」串成一步，main.ts 只负责取评论和发评论。
  *
  * 放在这里而不是 main.ts，是因为这一整步是纯函数：没有 octokit、没有 IO，
@@ -2359,6 +2407,16 @@ function buildRelaunchCommentBody(input) {
 function planRelaunch(input) {
     const isTransientEgress = (0, llm_retry_1.isTransientEgressFailure)(input.error, { model: input.model });
     const errorText = input.errorText || (0, llm_retry_1.errorMessage)(input.error);
+    // 先判「能不能起新 CI」，再判「该不该重启」：前者是物理前提，后者是策略。
+    // 顺序反过来的话，在 GITHUB_TOKEN 下会先把 hop 用掉再发现评论发不出去。
+    if (isGithubActionsToken(input.githubToken)) {
+        return {
+            shouldPost: false,
+            reason: "github-token 是 GITHUB_TOKEN（ghs_ 前缀）：用它发的评论不会触发新的 workflow run" +
+                "（GitHub 防递归规则，例外只有 workflow_dispatch / repository_dispatch），" +
+                "换 CI 不会发生。要启用请改用 PAT / GitHub App 令牌（ghp_ 或 github_pat_ 前缀）。",
+        };
+    }
     const decision = decideRelaunch({
         enabled: input.enabled,
         isTransientEgress,
