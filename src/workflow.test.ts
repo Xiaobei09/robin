@@ -1,6 +1,8 @@
 import { readFileSync, readdirSync } from "fs";
 import { join } from "path";
 
+import { AVAILABLE_COMMANDS } from "./commands";
+
 const repoRoot = join(__dirname, "..");
 const reviewWorkflow = readFileSync(
   join(repoRoot, ".github", "workflows", "review.yml"),
@@ -241,5 +243,51 @@ describe("reusable review workflow", () => {
     expect(readme).toContain(
       "If no matching runner is online, GitHub queues the job until one comes online.",
     );
+  });
+});
+
+/**
+ * R943：`review.yml` 的 job-if 里还有**第四份**命令清单。
+ *
+ * `AVAILABLE_COMMANDS`（权威）、`parseSlashCommand` 的正则、`/help` 的表格，
+ * 三份都在 `src/` 里，本轮把前两份归一了；但 `review.yml:123-126` 用
+ * `startsWith(github.event.comment.body, '/review') || ...` 又硬编码了一组。
+ *
+ * 这一份最危险：它是 job-if，**命令写漏了就不会起 run** —— 用户敲了命令、
+ * `/help` 里也列着、action 内部也认得，但整个 workflow 根本不触发，
+ * 而没有任何报错能指出「命令清单漏了一条」。
+ *
+ * 所以把它钉到清单上。这里已有先例（`documents every public action input in
+ * ADVANCED.md`、`keeps the consumer template on the canonical reusable workflow`），
+ * 都是同一类跨文件一致性断言。
+ */
+describe("job-if 与命令清单一致", () => {
+  const jobIfCommand = (text: string): string[] =>
+    Array.from(
+      text.matchAll(/github\.event\.comment\.body[^)]*?['"](\/[a-z][a-z0-9-]*)['"]/g),
+      (m) => m[1]
+    );
+
+  const fromList = AVAILABLE_COMMANDS.map((c) => c.command).sort();
+
+  // `review.yml` 和 `self-test.yml` 两份 job-if 都得跟着清单走。
+  // `self-test.yml` 的 `command-test` job 尤其关键：它是仓库自己的 e2e，
+  // job-if 一旦漏写命令，对应的 e2e 场景就**永远不会执行** ——
+  // 不报错、不失败，只是安静地不再测任何东西。
+  it.each([
+    ["review.yml", reviewWorkflow],
+    ["self-test.yml", selfTestWorkflow],
+  ])("%s 的 job-if 覆盖的正是清单里的每一个命令（不多不少）", (_name, workflow) => {
+    expect([...new Set(jobIfCommand(workflow))].sort()).toEqual(fromList);
+  });
+
+  it.each([
+    ["review.yml", reviewWorkflow],
+    ["self-test.yml", selfTestWorkflow],
+  ])("%s 的 job-if 里清单每条命令都真的出现过（漏写 = 命令静默不触发）", (_name, workflow) => {
+    const listedInJobIf = jobIfCommand(workflow);
+    for (const command of fromList) {
+      expect(listedInJobIf).toContain(command);
+    }
   });
 });
