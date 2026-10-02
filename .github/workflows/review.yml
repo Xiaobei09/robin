@@ -39,6 +39,11 @@ on:
         required: false
         type: string
         default: "600000"
+      llm-max-attempts:
+        description: "Attempts per LLM completion request (empty keeps the action default)."
+        required: false
+        type: string
+        default: ""
       llm-temperature:
         description: "Sampling temperature for LLM requests, between 0 and 2. Some models only accept a fixed value (for example Kimi requires 1)."
         required: false
@@ -128,6 +133,7 @@ jobs:
           max-output-tokens: ${{ inputs.max-output-tokens }}
           reasoning-effort: ${{ inputs.reasoning-effort }}
           llm-timeout-ms: ${{ inputs.llm-timeout-ms }}
+          llm-max-attempts: ${{ inputs.llm-max-attempts }}
           llm-temperature: ${{ inputs.llm-temperature }}
           min-command-permission: ${{ inputs.min-command-permission }}
           review-instructions: ${{ inputs.review-instructions }}

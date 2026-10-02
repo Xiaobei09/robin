@@ -117,6 +117,7 @@ Available on the [direct action](../action.yml) and the [reusable workflow](../.
 | `max-output-tokens` | empty | Cap response tokens (optional) |
 | `reasoning-effort` | empty (defer to repo config) | Optional provider reasoning effort, provider-dependent (for example `low`, `medium`, `high`). Empty defers to `.github/robin.yml`; if that is also unset, no `reasoning` property is sent |
 | `llm-timeout-ms` | `600000` | LLM timeout (10 minutes) |
+| `llm-max-attempts` | empty (defer to the action default) | Attempts per LLM completion request. Empty keeps the built-in default of 3 (5 for OpenRouter free-router models); raise it when the provider intermittently drops connections or returns 5xx, set `1` to disable retries. Values outside 1-10 are ignored with a warning |
 | `llm-temperature` | `0.1` | Sampling temperature (0–2). Raise only if your model rejects the default — some models accept a single fixed value (Kimi requires `1`) |
 | `max-comments` | `15` | Max inline comments |
 | `review-on-synchronize` | `false` | Review every new commit on the PR |

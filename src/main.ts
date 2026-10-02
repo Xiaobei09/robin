@@ -10,8 +10,15 @@ import { ReviewParser, StructuredReview } from "./review-parser";
 import { shouldRetryStructuredReview } from "./review-retry";
 import { GitHubReviewer, ROBIN_SIGNATURE } from "./github-reviewer";
 import {
+  buildInitialStatusBody,
+  decorateStatusCommentBody,
+  extractInheritedVerdict,
+  findLatestStatusComment,
+} from "./status-comment";
+import {
   DEFAULT_LLM_TEMPERATURE,
   DEFAULT_LLM_TIMEOUT_MS,
+  parseLLMMaxAttempts,
   parseLLMTemperature,
   parseLLMTimeout,
 } from "./config";
@@ -146,6 +153,19 @@ async function run(): Promise<void> {
         `Invalid llm-temperature value "${llmTemperatureInput}", using default ${DEFAULT_LLM_TEMPERATURE}`
       );
     }
+
+    // "Not configured" (empty / unparseable) resolves to undefined so the LLMClient
+    // constructor default applies, which keeps getLlmCompletionAttemptCount's
+    // OpenRouter free-router exception (5 attempts) intact.
+    const llmMaxAttemptsInput = core.getInput("llm-max-attempts") || "";
+    const { value: llmMaxAttempts, valid: llmMaxAttemptsValid } =
+      parseLLMMaxAttempts(llmMaxAttemptsInput);
+    if (!llmMaxAttemptsValid) {
+      core.warning(
+        `Invalid llm-max-attempts value "${llmMaxAttemptsInput}" ` +
+          `(expected an integer 1-10); using the built-in default`
+      );
+    }
     const inlineReviewInstructions = core.getInput("review-instructions") || "";
     const reviewInstructionsFile = core.getInput("review-instructions-file") || "";
     const configFile = core.getInput("config-file") || DEFAULT_CONFIG_FILE;
@@ -157,7 +177,14 @@ async function run(): Promise<void> {
     core.info(`Running /${command} on PR #${prNumber} in ${owner}/${repo}`);
     statusCommand = command === "summary" ? "summary" : "review";
     statusModel = model || "not configured";
-    statusCommentId = await postStatusComment(octokit, owner, repo, prNumber, command, statusModel);
+    statusCommentId = await resolveStatusCommentId(
+        octokit,
+        owner,
+        repo,
+        prNumber,
+        command,
+        statusModel
+      );
     onJobCancelled = async () => {
       if (octokit && statusCommentId) {
         // The SIGTERM grace period is short — never let the superseded check
@@ -282,7 +309,7 @@ async function run(): Promise<void> {
       model,
       maxOutputTokens,
       llmTimeoutMs,
-      undefined,
+      llmMaxAttempts,
       llmTemperature,
       async (detail) => {
         await updateStatusComment(
@@ -407,21 +434,21 @@ async function postStatusComment(
   repo: string,
   issueNumber: number,
   command: ReviewerCommand,
-  model: string
+  model: string,
+  inheritedVerdict?: string
 ): Promise<number | undefined> {
   try {
     const { data } = await octokit.rest.issues.createComment({
       owner,
       repo,
       issue_number: issueNumber,
-      body: [
-        "## " + ROBIN_SIGNATURE,
-        "",
-        ":eyes: On it — taking a look at this pull request.",
-        "",
-        `Mode: ${command === "summary" ? "summary" : "code review"}`,
-        `Model: ${model}`,
-      ].join("\n"),
+      body: decorateStatusCommentBody(
+        buildInitialStatusBody(
+          command === "summary" ? "summary" : "review",
+          model,
+          inheritedVerdict
+        )
+      ),
     });
     return data.id;
   } catch (error) {
@@ -444,11 +471,47 @@ async function updateStatusComment(
       owner,
       repo,
       comment_id: commentId,
-      body,
+      body: decorateStatusCommentBody(body),
     });
   } catch (error) {
     core.warning(`Could not update status comment: ${error}`);
   }
+}
+
+/**
+ * Reuse the previous run's status comment when there is one.
+ *
+ * Every run used to create a fresh comment, so a PR reviewed several times carried several
+ * "On it" comments and the newest could scroll out of view. A retried run now updates the
+ * existing comment in place and carries the previous verdict forward, so the evaluation the
+ * reader could already see is inherited instead of vanishing the moment a retry starts.
+ */
+async function resolveStatusCommentId(
+  octokit: any,
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  command: ReviewerCommand,
+  model: string
+): Promise<number | undefined> {
+  const existing = await findLatestStatusComment(octokit, owner, repo, issueNumber);
+  if (!existing) {
+    return postStatusComment(octokit, owner, repo, issueNumber, command, model);
+  }
+
+  const inheritedVerdict = extractInheritedVerdict(existing.body);
+  core.info(
+    `Adopting Robin status comment #${existing.id} from a previous run` +
+      (inheritedVerdict ? ` (carrying over: ${inheritedVerdict})` : "")
+  );
+  await updateStatusComment(
+    octokit,
+    owner,
+    repo,
+    existing.id,
+    buildInitialStatusBody(command === "summary" ? "summary" : "review", model, inheritedVerdict)
+  );
+  return existing.id;
 }
 
 function buildCompletedStatusBody(
