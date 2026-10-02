@@ -2,6 +2,12 @@ import { readFileSync, readdirSync } from "fs";
 import { join } from "path";
 
 import { AVAILABLE_COMMANDS } from "./commands";
+import {
+  DEFAULT_ACTION_MAX_DIFF_SIZE,
+  DEFAULT_MAX_COMMENTS,
+  resolveMaxComments,
+  resolveMaxDiffSize,
+} from "./repo-config";
 
 const repoRoot = join(__dirname, "..");
 const reviewWorkflow = readFileSync(
@@ -288,6 +294,125 @@ describe("job-if 与命令清单一致", () => {
     const listedInJobIf = jobIfCommand(workflow);
     for (const command of fromList) {
       expect(listedInJobIf).toContain(command);
+    }
+  });
+});
+
+/**
+ * R946：「未设置」哨兵的同一份真相有**五份副本**，改一处忘另一处就静默失效。
+ *
+ * `resolveMaxComments` / `resolveMaxDiffSize` 判断「调用方是否真的没传」的方式是
+ * 「解析结果是否等于默认常量」（见 repo-config.ts 的 isUnset）。这条哨兵必须在下面
+ * 五处逐字相等：
+ *
+ *   1. `repo-config.ts` 的常量
+ *   2. `action.yml` 的 input default
+ *   3. `.github/workflows/review.yml` 的 input default
+ *   4. `main.ts` 里 `getInput(...) || <兜底>` 的兜底
+ *   5. `docs/ADVANCED.md` 里写给人看的说明
+ *
+ * 只要有一处漂移，后果**不是报错而是无声降级**：哨兵不再等值 ⇒ 解析结果被当成
+ * 「调用方显式传了」⇒ `.github/robin.yml` 的配置被完全忽略，没有任何日志。
+ *
+ * 本轮实测到的实例：`main.ts` 里 `max-comments` 的兜底写的是字面量 `"25"`，
+ * 而常量是 15。`"25"` 恰好等于 `action.yml` 之外的旧默认值，一眼看不出来。
+ */
+describe("「未设置」哨兵：五份副本必须逐字相等（R946）", () => {
+  const mainSrc = readFileSync(join(repoRoot, "src", "main.ts"), "utf8");
+  // 剥注释：注释里会解释「这是哨兵」，里面必然出现数字，直接搜会被注释骗过。
+  const mainCode = mainSrc
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^[ \t]*\/\/.*$/gm, "");
+
+  /** 取 YAML 里某个 input 的 default（带引号原样返回）。缩进自适应。 */
+  function inputDefault(source: string, name: string): string | undefined {
+    const key = new RegExp(`^([ \\t]+)${name}:[ \\t]*$`, "m").exec(source);
+    if (!key) return undefined;
+    const indent = key[1].length;
+    const rest = source.slice(key.index + key[0].length);
+    let block = "";
+    for (const line of rest.split("\n")) {
+      if (line.trim() === "") {
+        block += "\n";
+        continue;
+      }
+      if ((line.match(/^[ \t]*/) as RegExpMatchArray)[0].length <= indent) break;
+      block += `${line}\n`;
+    }
+    return block.match(/^[ \t]+default:[ \t]*"?([^"\n]*)"?[ \t]*$/m)?.[1];
+  }
+
+  /** 取 main.ts 里 `core.getInput("x") || <兜底>` 的兜底表达式原文。 */
+  function mainFallback(name: string): string {
+    const m = new RegExp(`core\\.getInput\\("${name}"\\)\\s*\\|\\|\\s*(.+?);`).exec(mainCode);
+    expect(m).not.toBeNull();
+    return (m as RegExpMatchArray)[1].trim();
+  }
+
+  /**
+   * 判据分两层，这里是第一层（值相等）：
+   * 兜底要么引用正确的常量，要么是个与常量**等值**的字面量。
+   *
+   * 第二层在下面（「不再用裸数字兜底」）**禁止任何字面量**，比这一层更严。
+   * 第一层单独存在时会放过 `|| "15"`，实测（M36）真正报红的是第二层。
+   * 两层都要：第二层防的是「同一份真相被复制成第六份」，第一层防的是
+   * 「引用了错的常量」——后者第二层看不见（`String(别的常量)` 不是字面量）。
+   */
+  function expectFallbackMeans(name: string, constName: string, value: number) {
+    const expr = mainFallback(name);
+    const asLiteral = /^["'`](\d+)["'`]$/.exec(expr);
+    if (asLiteral) {
+      expect({ knob: name, fallback: expr }).toEqual({ knob: name, fallback: String(value) });
+    } else {
+      expect(expr).toBe(`String(${constName})`);
+    }
+  }
+
+  it.each([
+    ["max-comments", "DEFAULT_MAX_COMMENTS", DEFAULT_MAX_COMMENTS],
+    ["max-diff-size", "DEFAULT_ACTION_MAX_DIFF_SIZE", DEFAULT_ACTION_MAX_DIFF_SIZE],
+  ])("%s：action.yml 与 review.yml 的 default 都等于常量", (name, _constName, value) => {
+    const want = String(value);
+    expect({ where: "action.yml", got: inputDefault(actionYml, name) }).toEqual({
+      where: "action.yml",
+      got: want,
+    });
+    expect({ where: "review.yml", got: inputDefault(reviewWorkflow, name) }).toEqual({
+      where: "review.yml",
+      got: want,
+    });
+  });
+
+  it.each([
+    ["max-comments", "DEFAULT_MAX_COMMENTS", DEFAULT_MAX_COMMENTS],
+    ["max-diff-size", "DEFAULT_ACTION_MAX_DIFF_SIZE", DEFAULT_ACTION_MAX_DIFF_SIZE],
+  ])("%s：main.ts 的兜底表达的就是这个默认值", (name, constName, value) => {
+    expectFallbackMeans(name, constName, value);
+  });
+
+  it("main.ts 里这两个 input 不再用裸数字兜底（避免同一份真相再被复制）", () => {
+    // 精确匹配 `|| <裸数字字面量>`，不误伤 `|| ""` 这类语义不同的兜底。
+    expect(mainCode).not.toMatch(/getInput\("(?:max-comments|max-diff-size)"\)\s*\|\|\s*["'`]\d+["'`]/);
+    // 已知上限（不假装完备）：这是**正则判据**，有构造性输入上限。
+    // `|| String(15)` / `|| (15).toString()` 能绕过它，而那仍是把常量复制了一份。
+    // 要语义级得编译 main.ts 求值 —— 代价过高，本轮不做，改为如实标注。
+  });
+
+  it("哨兵真的能让 repo 配置赢：空输入 + repo 有值 ⇒ 取 repo 的值", () => {
+    // 这是哨兵存在的**理由**。若哪天改成别的判定方式，下面两条会红，
+    // 而那时「action default 等于常量」这条相等性本身未必察觉得到。
+    expect(resolveMaxComments(String(DEFAULT_MAX_COMMENTS), { maxComments: 8 })).toBe(8);
+    expect(resolveMaxDiffSize(String(DEFAULT_ACTION_MAX_DIFF_SIZE), { maxDiffSize: 9 })).toBe(9);
+  });
+
+  it("docs/ADVANCED.md 写给人的默认值也等于常量（文档漂移同样是静默降级）", () => {
+    for (const line of advancedDocs.split("\n")) {
+      // 只看明确介绍这两个 knob 默认值的表格行：`| `max-comments` | `15` | ...`
+      const m = /^\|\s*`(max-comments|max-diff-size)`\s*\|\s*`?(\d+)`?\s*\|/.exec(line);
+      if (!m) continue;
+      const expected =
+        m[1] === "max-comments" ? String(DEFAULT_MAX_COMMENTS) : String(DEFAULT_ACTION_MAX_DIFF_SIZE);
+      expect({ knob: m[1], documented: m[2] }).toEqual({ knob: m[1], documented: expected });
     }
   });
 });
