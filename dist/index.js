@@ -1691,6 +1691,7 @@ async function run() {
 async function maybeRelaunchOnEgressFailure(input) {
     try {
         const commentBodies = await listIssueCommentBodies(input.octokit, input.owner, input.repo, input.prNumber);
+        const headSha = await (0, relaunch_1.resolveHeadSha)(input.octokit, input.owner, input.repo, input.prNumber, github.context.payload);
         const plan = (0, relaunch_1.planRelaunch)({
             enabled: input.enabled,
             error: input.error,
@@ -1698,6 +1699,7 @@ async function maybeRelaunchOnEgressFailure(input) {
             maxRelaunches: input.maxRelaunches,
             model: input.model,
             githubToken: input.githubToken,
+            headSha,
         });
         if (!plan.shouldPost || !plan.body) {
             // 「发了也起不了新 CI」不是普通的信息，是消费方配错了凭据 ——
@@ -2255,6 +2257,7 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.DEFAULT_RELAUNCH_ON_EGRESS_FAILURE = exports.DEFAULT_MAX_RELAUNCHES = exports.RELAUNCH_MARKER = exports.RELAUNCH_COMMAND = void 0;
 exports.resolveMaxRelaunches = resolveMaxRelaunches;
 exports.resolveRelaunchOnEgressFailure = resolveRelaunchOnEgressFailure;
+exports.resolveHeadSha = resolveHeadSha;
 exports.readPreviousHop = readPreviousHop;
 exports.decideRelaunch = decideRelaunch;
 exports.buildRelaunchCommentBody = buildRelaunchCommentBody;
@@ -2289,24 +2292,124 @@ function resolveRelaunchOnEgressFailure(raw) {
     return !/^(false|0|no|off)$/i.test(String(raw).trim());
 }
 /**
+ * 取被审查的 head commit，用来给 hop 记账划作用域（见 readPreviousHop）。
+ *
+ * **best-effort，拿不到就返回 undefined**，而 undefined 的含义是「不划作用域＝
+ * 全算历史 hop」——也就是老行为、偏保守的一侧。所以这里失败是可以接受的，
+ * 不能接受的是「猜一个 sha 填进去」：猜错会让额度算到别的 commit 上，
+ * 既可能白烧 CI 分钟，也可能把本次该有的重启误判成超限。
+ *
+ * `pull_request` 事件的 payload 自带 head sha（免费）；`issue_comment` 事件没有，
+ * 才发一次 pulls.get。整条重启路径本来就已经在发 listComments 请求了，
+ * 多这一次不影响成本量级。
+ *
+ * 放在这里而不是 main.ts，是因为它有真正的分支逻辑（payload 优先、API 兜底、
+ * 各种失败形态都归一到 undefined），而这些分支正是需要被单测钉住的东西 ——
+ * R937 的 M9/M10 两次变异存活，就是因为它当时躺在 main.ts 里、没人能测。
+ */
+async function resolveHeadSha(octokit, owner, repo, prNumber, payload) {
+    const fromPayload = payload?.pull_request?.head?.sha;
+    if (typeof fromPayload === "string" && fromPayload.trim()) {
+        return fromPayload.trim();
+    }
+    try {
+        const pulls = octokit?.rest?.pulls;
+        if (typeof pulls?.get !== "function")
+            return undefined;
+        const { data } = await pulls.get({ owner, repo, pull_number: prNumber });
+        const head = data?.head?.sha;
+        return typeof head === "string" && head.trim() ? head.trim() : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+/** 两个 sha 是否指同一个 commit（容忍一边是缩写）。 */
+function sameCommit(a, b) {
+    const x = a.toLowerCase();
+    const y = b.toLowerCase();
+    return x.startsWith(y) || y.startsWith(x);
+}
+/**
+ * 解析重启评论的机器可读块：`RELAUNCH_MARKER` 之后、连续形如 `key=value` 的那几行。
+ *
+ * **只读这一段，不全文搜 `hop=`**。错误摘要是网关/用户给的自由文本，里面完全可能
+ * 出现 `hop=99` 或 `sha=<某个 commit>`；全文搜索会让一条普通评论伪装成「已经用掉
+ * 99 次额度」，或者把额度算到不相干的 commit 上 —— 而 hop 是**成本护栏**，
+ * 被伪造的方向只会是「多重启」，也就是白烧 CI 分钟。
+ *
+ * 块的结束条件有两个：空行，或出现第一行不含 `=` 的内容（人类可读部分开始）。
+ * 块起始前的空行直接跳过 —— 正文里 marker 后面本来就跟着换行。
+ */
+function parseRelaunchMeta(body) {
+    const start = body.indexOf(exports.RELAUNCH_MARKER);
+    if (start < 0)
+        return {};
+    const meta = {};
+    let started = false;
+    for (const line of body.slice(start + exports.RELAUNCH_MARKER.length).split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+            if (started)
+                break;
+            continue;
+        }
+        const eq = trimmed.indexOf("=");
+        if (eq <= 0)
+            break;
+        started = true;
+        const key = trimmed.slice(0, eq).trim();
+        const value = trimmed.slice(eq + 1).trim();
+        if (key === "hop") {
+            // 正文写的是 `hop=1 of 2`，取第一个 token 才是跳数。
+            const parsed = Number(value.split(/\s+/)[0]);
+            if (Number.isFinite(parsed))
+                meta.hop = parsed;
+        }
+        else if (key === "sha" && /^[0-9a-fA-F]{7,40}$/.test(value)) {
+            meta.headSha = value;
+        }
+    }
+    return meta;
+}
+/**
  * 从已发评论里取回上一次重启用掉的 hop 数。
  *
  * 扫**最后**一次出现：一轮接一轮会在正文里叠出多条 `hop=`，取最新的那个才对。
  * 没有标记说明还没重启过（hop 0）。
+ *
+ * **作用域（`headSha`）**：hop 额度是「这一次审查」的上限，不是「这个 PR 有史以来」
+ * 的上限。早期版本不划作用域，于是同一个 PR 上任何一次历史故障烧掉的 hop 会
+ * **永久**钉死这个 PR 的额度 —— 三周后新推一个 commit、出口又坏了，本该有的两次
+ * 重启一次都拿不到，而且没有任何日志解释为什么。所以：给了 `headSha` 时，只认
+ * 同一 commit 上的重启评论；换了 commit 就是一次新审查，额度重新算。
+ *
+ * 为什么用 commit 而不是时间窗口：时间窗口一旦短于「一轮级联的实际时长」
+ * （`llm-timeout` 可配到很大，一次失败就能耗掉几十分钟），窗口外的重启评论
+ * 就不再计数 ⇒ 额度每轮重置 ⇒ **无限重启**，护栏反向失效。commit 作用域没有
+ * 这个失效方向：同一个 commit 上 hop 必然单调递增到上限，换 commit 才会重置。
+ *
+ * **fail closed 的两处，都往「不敢多重启」的方向偏**：
+ * - 拿不到当前 head（`headSha` 为空）⇒ 照旧全算，等于老行为，宁可少重启。
+ * - 老版本 robin 发的评论没带 `sha=` 行 ⇒ 不计入当前额度，会多给一次机会。
+ *   往贵的那侧偏一格，可接受；反方向则会白烧 CI 分钟。
  */
-function readPreviousHop(commentBodies) {
+function readPreviousHop(commentBodies, opts = {}) {
+    const headSha = typeof opts.headSha === "string" ? opts.headSha.trim() : "";
     let hop = 0;
     for (const body of commentBodies) {
         if (typeof body !== "string")
             continue;
-        if (!body.includes(exports.RELAUNCH_MARKER))
+        const meta = parseRelaunchMeta(body);
+        if (meta.hop === undefined)
             continue;
-        const match = body.match(/hop=(\d+)/);
-        if (!match)
-            continue;
-        const parsed = Number(match[1]);
-        if (Number.isFinite(parsed) && parsed > hop)
-            hop = parsed;
+        if (headSha) {
+            // 没有 sha 行的旧评论、以及属于别的 commit 的评论，都不占用本次额度。
+            if (!meta.headSha || !sameCommit(meta.headSha, headSha))
+                continue;
+        }
+        if (meta.hop > hop)
+            hop = meta.hop;
     }
     return hop;
 }
@@ -2345,11 +2448,17 @@ function decideRelaunch(input) {
  * 人类可读部分。
  */
 function buildRelaunchCommentBody(input) {
-    return [
+    const lines = [
         exports.RELAUNCH_COMMAND,
         "",
         exports.RELAUNCH_MARKER,
         `hop=${input.hop} of ${input.maxRelaunches}`,
+    ];
+    const headSha = typeof input.headSha === "string" ? input.headSha.trim() : "";
+    if (headSha)
+        lines.push(`sha=${headSha}`);
+    return [
+        ...lines,
         "",
         `🔁 出口故障，放弃本次 CI 并换一个 CI 继续审查（第 ${input.hop}/${input.maxRelaunches} 次）。`,
         "",
@@ -2420,7 +2529,7 @@ function planRelaunch(input) {
     const decision = decideRelaunch({
         enabled: input.enabled,
         isTransientEgress,
-        previousHop: readPreviousHop(input.commentBodies),
+        previousHop: readPreviousHop(input.commentBodies, { headSha: input.headSha }),
         maxRelaunches: input.maxRelaunches,
         errorText,
     });
@@ -2435,6 +2544,7 @@ function planRelaunch(input) {
             hop: decision.hop,
             maxRelaunches: input.maxRelaunches,
             errorText,
+            headSha: input.headSha,
         }),
     };
 }
