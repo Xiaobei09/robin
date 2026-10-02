@@ -232,6 +232,27 @@ export function decideRelaunch(input: {
 }
 
 /**
+ * 把错误文本收拾成能安全放进围栏代码块的一行。
+ *
+ * **为什么在这里做，而不是指望上游。** `errorMessage()` 会把空白折叠成空格，所以走
+ * 默认路径（`main.ts` 调 `planRelaunch` 时不传 `errorText`）时围栏本来就击不穿 ——
+ * 这条安全性是**偶然**的：它成立只因为「恰好没有调用方传 `errorText`」，而这是个
+ * 没有任何断言看守的前提。一旦有人开始传多行或含围栏的 `errorText`，围栏一破，
+ * 剩下的错误文本就以正文 markdown 渲染出来：里面的 `*` / `_` / `[` 会被解析成强调或
+ * 链接，而它来自网关的**自由文本** —— 用户会看到一段被渲染坏的、来源不明的内容，
+ * 还可能带上一条假链接。
+ *
+ * 在使用点收敛，代价是几行代码；换来的是「无论调用方传什么都不会击穿」。
+ */
+function fenceSafe(text: string): string {
+  return String(text ?? "")
+    // 三个及以上连续反引号就能闭合 ``` 围栏，无论它在行内还是独占一行。
+    .replace(/`{3,}/g, "'" + "'" + "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
  * 重启评论正文。
  *
  * `RELAUNCH_COMMAND` 必须在最前面（消费方守卫用 startsWith），其后才是标记与
@@ -260,7 +281,7 @@ export function buildRelaunchCommentBody(input: {
     "**原因**（瞬时出口故障，换一个 runner 有机会恢复）：",
     "",
     "```",
-    input.errorText,
+    fenceSafe(input.errorText),
     "```",
     "",
     `若连续 ${input.maxRelaunches} 次仍失败，说明不是瞬时问题，需要检查 gateway 与 LLM 出口配置。`,

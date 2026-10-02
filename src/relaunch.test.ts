@@ -551,3 +551,67 @@ describe("换 CI 的触发命令必须是真命令（R943）", () => {
     expect(AVAILABLE_COMMANDS.map((c) => c.command)).toContain(RELAUNCH_COMMAND);
   });
 });
+
+/**
+ * R945：错误文本是网关给的**自由文本**，却被原样塞进 ``` 围栏。
+ *
+ * 围栏一破，后面的内容就以正文 markdown 渲染：`*` `_` 会变成强调，`[x](y)` 会变成
+ * 假链接。来源不可控 ⇒ 渲染结果也不可控。
+ *
+ * 关键在于**这条安全性此前是偶然的**：`errorMessage()` 会把空白折叠成空格，而唯一的
+ * 调用方（`main.ts` 里 `planRelaunch({...})`）不传 `errorText`，所以围栏击不穿。
+ * 但「恰好没人传」是个没有断言看守的前提 —— `planRelaunch` 的 `errorText` 是公开可选
+ * 参数，任何人加个调用点传多行文本，围栏就破了，而当时没有任何测试会红。
+ *
+ * 与 R941/R944 同一族：正确性依赖一个未被断言的前提。所以在使用点收敛。
+ */
+describe("重启评论的围栏击不穿（R945）", () => {
+  const bodyWith = (errorText: string): string =>
+    buildRelaunchCommentBody({ hop: 1, maxRelaunches: 2, errorText });
+
+  it("围栏内恰好只有一对``` （错误文本含围栏时也不多不少）", () => {
+    for (const nasty of [
+      "```",
+      "```\n```",
+      "boom\n```\nnow I am markdown [click](https://evil.example)",
+      "a```b",
+      "``````",
+    ]) {
+      const body = bodyWith(nasty);
+      // 去掉开头两处已知围栏后，剩下的就是 errorText 渲染出来的部分：
+      // 它里面不允许再出现 ```，否则围栏已被闭合。
+      const fences = body.match(/```/g) ?? [];
+      expect(fences.length).toBe(2);
+      expect(fences.length % 2).toBe(0);
+    }
+  });
+
+  it("多行错误文本被压成单行，不会自己撑开围栏", () => {
+    const body = bodyWith("line1\nline2\n\nline3");
+    const inner = body.split("```")[1];
+    // 收到的其实是 "\nline1 line2 line3\n" —— 首尾那两个换行是**围栏自己的定界换行**，
+    // 不是内容里的。第一版写成 `expect(inner).not.toContain("\n")` 于是恒红，
+    // 而代码其实是对的：内容确实已被压成单行。
+    // （判据要区分「围栏的换行」与「内容的换行」，否则基线自红、报红毫无意义。）
+    expect(inner.trim()).not.toContain("\n");
+    expect(inner.trim()).toBe("line1 line2 line3");
+  });
+
+  it("RELAUNCH_COMMAND 仍在第一行（消费方守卫靠 startsWith）", () => {
+    // 收敛错误文本不能碰到正文最前面那一行
+    for (const nasty of ["```", "```\n```", "x```y"]) {
+      expect(bodyWith(nasty).split("\n")[0]).toBe(RELAUNCH_COMMAND);
+    }
+  });
+
+  it("hop 记账块不受影响（机器可读段必须完好）", () => {
+    const body = bodyWith("```\nhop=99 of 2\n```");
+    expect(body).toContain("hop=1 of 2");
+    expect(readPreviousHop([body])).toBe(1);
+  });
+
+  it("普通错误文本原样保留（不啰嗦、不吞信息）", () => {
+    const body = bodyWith("connect ETIMEDOUT 10.0.0.1:443");
+    expect(body).toContain("connect ETIMEDOUT 10.0.0.1:443");
+  });
+});
