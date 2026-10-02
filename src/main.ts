@@ -10,11 +10,13 @@ import { ReviewParser, StructuredReview } from "./review-parser";
 import { shouldRetryStructuredReview } from "./review-retry";
 import { GitHubReviewer, ROBIN_SIGNATURE } from "./github-reviewer";
 import {
+  buildFailedStatusBody,
   buildInitialStatusBody,
   decorateStatusCommentBody,
   extractInheritedVerdict,
   findLatestStatusComment,
 } from "./status-comment";
+import { errorMessage } from "./llm-retry";
 import {
   DEFAULT_LLM_TEMPERATURE,
   DEFAULT_LLM_TIMEOUT_MS,
@@ -466,7 +468,15 @@ async function run(): Promise<void> {
     core.info("Done.");
 
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    // 这里必须走 errorMessage()，不能就地写 `error instanceof Error ? error.message : String(error)`：
+    // 那条内联三元对空 message 会原样返回空串，于是失败评论里出现一个空的
+    // `Reason:` 行（生产实证 SiliconMod/Silicon#67，run 36585231278）。
+    // errorMessage() 兜空、并把 octokit 只写在壳里的原因（response.data.message）取出来。
+    //
+    // 注意这里只改「给人看的文本」。换 CI 的判定走的是下面传给 maybeRelaunchOnEgressFailure
+    // 的原始 `error`（planRelaunch 内部自己分类，不收 errorText），
+    // 所以永久性错误的 fail-closed 完全不受影响。
+    const message = errorMessage(error);
     if (octokit && statusOwner && statusRepo && statusCommentId) {
       await updateStatusComment(octokit, statusOwner, statusRepo, statusCommentId, buildFailedStatusBody(message, statusCommand));
     }
@@ -746,18 +756,6 @@ function buildSkippedFilterStatusBody(removedFiles: string[]): string {
     `Skipped: ${preview}${suffix}`,
     "",
     "Add `skip-paths` in `.github/robin.yml` if that's not what you expected.",
-  ].join("\n");
-}
-
-function buildFailedStatusBody(errorMessage: string, command: "review" | "summary"): string {
-  return [
-    "## " + ROBIN_SIGNATURE,
-    "",
-    `:warning: I couldn't finish the ${command === "summary" ? "summary" : "review"} this time.`,
-    "",
-    `Reason: ${errorMessage}`,
-    "",
-    "Free model routes drop sometimes — comment `/robin` to try again. (No secrets are included in this message.)",
   ].join("\n");
 }
 
