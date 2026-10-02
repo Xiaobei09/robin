@@ -1,9 +1,12 @@
+import { readFileSync } from "fs";
+import { join } from "path";
 import {
   buildRelaunchCommentBody,
   decideRelaunch,
   isGithubActionsToken,
   planRelaunch,
   readPreviousHop,
+  resolveHeadSha,
   RELAUNCH_COMMAND,
   RELAUNCH_MARKER,
   resolveMaxRelaunches,
@@ -291,6 +294,224 @@ describe("换出口 = 抛弃当前 CI，另起一个新 CI（R922）", () => {
         maxRelaunches: 2,
       });
       expect(plan.shouldPost).toBe(true);
+    });
+  });
+
+  // R937：hop 额度必须按「被审查的那个 commit」划作用域。
+  // 否则一次历史故障烧掉的 hop 会**永久**钉死这个 PR 的额度：三周后新推了
+  // commit、出口又坏了，本该有的两次重启一次都拿不到，日志里还什么都不说。
+  describe("hop 记账的作用域（R937）", () => {
+    const SHA_A = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0";
+    const SHA_B = "0f9e8d7c6b5a4938271605f4e3d2c1b0a9988776";
+
+    it("正文把 sha 记在机器块里", () => {
+      const body = buildRelaunchCommentBody({
+        hop: 1,
+        maxRelaunches: 2,
+        errorText: "x",
+        headSha: SHA_A,
+      });
+      expect(body).toContain(`sha=${SHA_A}`);
+    });
+
+    it("没给 headSha 就不写 sha 行（不能凭空造一个）", () => {
+      const body = buildRelaunchCommentBody({
+        hop: 1,
+        maxRelaunches: 2,
+        errorText: "x",
+      });
+      expect(body).not.toMatch(/^sha=/m);
+    });
+
+    it("同一 commit 上的重启评论照常计数", () => {
+      const body = buildRelaunchCommentBody({
+        hop: 1,
+        maxRelaunches: 2,
+        errorText: "x",
+        headSha: SHA_A,
+      });
+      expect(readPreviousHop([body], { headSha: SHA_A })).toBe(1);
+    });
+
+    it("换了 commit：历史 hop 不再占用本次额度", () => {
+      const body = buildRelaunchCommentBody({
+        hop: 2,
+        maxRelaunches: 2,
+        errorText: "x",
+        headSha: SHA_A,
+      });
+      expect(readPreviousHop([body], { headSha: SHA_A })).toBe(2);
+      expect(readPreviousHop([body], { headSha: SHA_B })).toBe(0);
+    });
+
+    it("拿不到 head 时退回老行为（全部计数，偏保守的一侧）", () => {
+      const body = buildRelaunchCommentBody({
+        hop: 2,
+        maxRelaunches: 2,
+        errorText: "x",
+        headSha: SHA_A,
+      });
+      expect(readPreviousHop([body])).toBe(2);
+      expect(readPreviousHop([body], { headSha: "" })).toBe(2);
+      expect(readPreviousHop([body], { headSha: "   " })).toBe(2);
+      expect(readPreviousHop([body], { headSha: null })).toBe(2);
+    });
+
+    it("老版本评论（没有 sha 行）在有 head 时不计数，没 head 时照旧", () => {
+      const legacy = buildRelaunchCommentBody({
+        hop: 2,
+        maxRelaunches: 2,
+        errorText: "x",
+      });
+      expect(readPreviousHop([legacy], { headSha: SHA_A })).toBe(0);
+      expect(readPreviousHop([legacy])).toBe(2);
+    });
+
+    it("缩写 sha 也能对上同一个 commit", () => {
+      const body = buildRelaunchCommentBody({
+        hop: 1,
+        maxRelaunches: 2,
+        errorText: "x",
+        headSha: SHA_A.slice(0, 10),
+      });
+      expect(readPreviousHop([body], { headSha: SHA_A })).toBe(1);
+      expect(readPreviousHop([body], { headSha: SHA_B })).toBe(0);
+    });
+
+    // 下面两条是判别性用例：都只在「全文搜 hop=/sha=」的实现下才会失败。
+    // 错误摘要是网关给的自由文本，出现整行的 hop=/sha= 完全正常；
+    // hop 是成本护栏，被伪造的方向只能是「多重启」＝白烧 CI 分钟。
+    it("错误摘要里整行出现 sha= 不能把评论挪到别的 commit 上", () => {
+      const spoofed = buildRelaunchCommentBody({
+        hop: 1,
+        maxRelaunches: 2,
+        errorText: `gateway log:\nsha=${SHA_B}\nend`,
+        headSha: SHA_A,
+      });
+      expect(readPreviousHop([spoofed], { headSha: SHA_B })).toBe(0);
+      expect(readPreviousHop([spoofed], { headSha: SHA_A })).toBe(1);
+    });
+
+    it("有 marker 但机器块里没有 hop 的评论不占用额度", () => {
+      const malformed = [RELAUNCH_MARKER, "", "human says hop=9"].join("\n");
+      expect(readPreviousHop([malformed])).toBe(0);
+    });
+
+    it("接线：新 commit 上额度重新从 1 开始，同 commit 上仍然用满", () => {
+      const transient = Object.assign(new Error("fetch failed"), {
+        code: "ECONNRESET",
+      });
+      const stale = buildRelaunchCommentBody({
+        hop: 2,
+        maxRelaunches: 2,
+        errorText: "x",
+        headSha: SHA_A,
+      });
+      const sameCommit = planRelaunch({
+        enabled: true,
+        error: transient,
+        commentBodies: [stale],
+        maxRelaunches: 2,
+        githubToken: "ghp_classicPATvalue1234567",
+        headSha: SHA_A,
+      });
+      expect(sameCommit.shouldPost).toBe(false);
+
+      const newCommit = planRelaunch({
+        enabled: true,
+        error: transient,
+        commentBodies: [stale],
+        maxRelaunches: 2,
+        githubToken: "ghp_classicPATvalue1234567",
+        headSha: SHA_B,
+      });
+      expect(newCommit.shouldPost).toBe(true);
+      expect(newCommit.hop).toBe(1);
+      expect(newCommit.body).toContain(`sha=${SHA_B}`);
+    });
+
+    // M9/M10 两次变异存活暴露的缺口：resolveHeadSha 当时躺在 main.ts 里，
+    // 而 run() 是依赖 github.context / octokit 的进程级函数、不在任何单测的
+    // 覆盖范围里 —— 「planRelaunch 收得到 headSha」没人钉，删掉传参 38 条全绿。
+    // 这正是 R926/R934 同一个根因的第五次现身。
+    // 修法不是加更宽的正则（源码正则天生拦不住「传了但传成 undefined」），
+    // 而是把这个函数搬进 relaunch.ts，让它的分支能被真调用、真断言。
+    describe("resolveHeadSha（拿不到就 undefined，绝不猜）", () => {
+      it("pull_request 事件：payload 自带 head，不发请求", async () => {
+        const get = jest.fn();
+        const octokit = { rest: { pulls: { get } } };
+        const sha = await resolveHeadSha(
+          octokit,
+          "o",
+          "r",
+          68,
+          { pull_request: { head: { sha: `  ${SHA_A}\n` } } }
+        );
+        expect(sha).toBe(SHA_A);
+        expect(get).not.toHaveBeenCalled();
+      });
+
+      it("issue_comment 事件：payload 没有，回落 pulls.get", async () => {
+        const get = jest.fn().mockResolvedValue({ data: { head: { sha: SHA_B } } });
+        const octokit = { rest: { pulls: { get } } };
+        const sha = await resolveHeadSha(octokit, "o", "r", 68, {
+          issue: { number: 68 },
+        });
+        expect(sha).toBe(SHA_B);
+        expect(get).toHaveBeenCalledWith({
+          owner: "o",
+          repo: "r",
+          pull_number: 68,
+        });
+      });
+
+      it("各种失败形态一律归一到 undefined（= 不划作用域 = 偏保守）", async () => {
+        const thrower = {
+          rest: {
+            pulls: {
+              get: jest.fn().mockRejectedValue(new Error("404 Not Found")),
+            },
+          },
+        };
+        await expect(resolveHeadSha(thrower, "o", "r", 68, {})).resolves.toBeUndefined();
+        const noGet = { rest: { pulls: {} } };
+        await expect(resolveHeadSha(noGet, "o", "r", 68, {})).resolves.toBeUndefined();
+        const emptySha = {
+          rest: { pulls: { get: jest.fn().mockResolvedValue({ data: { head: {} } }) } },
+        };
+        await expect(resolveHeadSha(emptySha, "o", "r", 68, {})).resolves.toBeUndefined();
+        await expect(
+          resolveHeadSha({ rest: { pulls: { get: jest.fn() } } }, "o", "r", 68, undefined)
+        ).resolves.toBeUndefined();
+      });
+
+      it("payload 里的 sha 是空白/非字符串时不能被当成有效 sha", async () => {
+        const get = jest.fn().mockResolvedValue({ data: { head: { sha: SHA_B } } });
+        const octokit = { rest: { pulls: { get } } };
+        // payload 说 sha="   " ⇒ 不能直接返回，必须继续走 API 兜底
+        expect(
+          await resolveHeadSha(octokit, "o", "r", 68, {
+            pull_request: { head: { sha: "   " } },
+          })
+        ).toBe(SHA_B);
+        // payload 里 sha 根本不是字符串 ⇒ 同样走 API
+        expect(
+          await resolveHeadSha(octokit, "o", "r", 68, {
+            pull_request: { head: { sha: 12345 } },
+          })
+        ).toBe(SHA_B);
+      });
+    });
+
+    // 接线断言保留一条，但收窄到「确实把 resolveHeadSha 的返回值原样传下去」。
+    // 它拦不住「传成 undefined」（那是 M10，上面已由 resolveHeadSha 的单测覆盖），
+    // 它能拦住的是「整个传参被删掉 / 改名 / 换成别的值」。
+    it("接线：main.ts 把 resolveHeadSha 的返回值传进 planRelaunch", () => {
+      const src = readFileSync(join(__dirname, "main.ts"), "utf8");
+      expect(src).toMatch(/const headSha = await resolveHeadSha\(/);
+      const call = src.match(/planRelaunch\(\{[\s\S]*?\}\)/);
+      expect(call).not.toBeNull();
+      expect(call![0]).toMatch(/^\s*headSha,\s*$/m);
     });
   });
 });

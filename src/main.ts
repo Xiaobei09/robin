@@ -39,6 +39,7 @@ import { ReviewerCommand, hasRequiredPermission, parseSlashCommand } from "./com
 import {
   isGithubActionsToken,
   planRelaunch,
+  resolveHeadSha,
   resolveMaxRelaunches,
   resolveRelaunchOnEgressFailure,
 } from "./relaunch";
@@ -525,6 +526,13 @@ async function maybeRelaunchOnEgressFailure(input: {
       input.repo,
       input.prNumber
     );
+    const headSha = await resolveHeadSha(
+      input.octokit,
+      input.owner,
+      input.repo,
+      input.prNumber,
+      github.context.payload
+    );
     const plan = planRelaunch({
       enabled: input.enabled,
       error: input.error,
@@ -532,6 +540,7 @@ async function maybeRelaunchOnEgressFailure(input: {
       maxRelaunches: input.maxRelaunches,
       model: input.model,
       githubToken: input.githubToken,
+      headSha,
     });
     if (!plan.shouldPost || !plan.body) {
       // 「发了也起不了新 CI」不是普通的信息，是消费方配错了凭据 ——
