@@ -44,6 +44,16 @@ on:
         required: false
         type: string
         default: ""
+      llm-relaunch-on-egress-failure:
+        description: "Abandon this CI and start a fresh one when a transient LLM egress failure blocks the review."
+        required: false
+        type: boolean
+        default: true
+      llm-max-relaunches:
+        description: "How many times one review may be relaunched on a fresh CI because of transient LLM egress failures (empty keeps the action default of 2)."
+        required: false
+        type: string
+        default: ""
       llm-temperature:
         description: "Sampling temperature for LLM requests, between 0 and 2. Some models only accept a fixed value (for example Kimi requires 1)."
         required: false
@@ -134,6 +144,8 @@ jobs:
           reasoning-effort: ${{ inputs.reasoning-effort }}
           llm-timeout-ms: ${{ inputs.llm-timeout-ms }}
           llm-max-attempts: ${{ inputs.llm-max-attempts }}
+          llm-relaunch-on-egress-failure: ${{ inputs.llm-relaunch-on-egress-failure }}
+          llm-max-relaunches: ${{ inputs.llm-max-relaunches }}
           llm-temperature: ${{ inputs.llm-temperature }}
           min-command-permission: ${{ inputs.min-command-permission }}
           review-instructions: ${{ inputs.review-instructions }}

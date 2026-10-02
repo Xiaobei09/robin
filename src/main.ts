@@ -36,6 +36,11 @@ import {
 } from "./repo-config";
 import { getReviewPrompt, getSummaryPrompt, getHelpMessage } from "./prompts/review-prompts";
 import { ReviewerCommand, hasRequiredPermission, parseSlashCommand } from "./commands";
+import {
+  planRelaunch,
+  resolveMaxRelaunches,
+  resolveRelaunchOnEgressFailure,
+} from "./relaunch";
 
 async function run(): Promise<void> {
   let octokit: ReturnType<typeof github.getOctokit> | undefined;
@@ -45,6 +50,13 @@ async function run(): Promise<void> {
   let statusCommand: "review" | "summary" = "review";
   let statusModel = "not configured";
   let onJobCancelled: (() => Promise<void>) | undefined;
+  // 「换出口」用得到的东西必须在 try 外面：决定重启的动作恰恰发生在 catch 里，
+  // 而 catch 只能看到 run() 作用域的变量。prNumber 原本是 try 内部的 let，
+  // 提到这里跟着 statusOwner/statusRepo 走。
+  let statusPrNumber: number | undefined;
+  let relaunchEnabled = false;
+  let maxRelaunches = 0;
+  let llmModel = "";
 
   try {
     const eventName = github.context.eventName;
@@ -78,8 +90,7 @@ async function run(): Promise<void> {
 
       shouldRun = true;
       prNumber = payload.pull_request?.number;
-    } else if (eventName === "issue_comment") {
-      const commentBody: string = payload.comment?.body || "";
+    } else if (eventName === "issue_comment") {      const commentBody: string = payload.comment?.body || "";
 
       if (!payload.issue?.pull_request) {
         core.info("Issue comment is not on a pull request. Skipping.");
@@ -130,10 +141,18 @@ async function run(): Promise<void> {
       core.info("No matching trigger found. Skipping.");
       return;
     }
+    statusPrNumber = prNumber;
+    // 「换出口」的两个开关在这里读一次：输入可能非法/缺失，解析成确定值后
+    // 存到外层，catch 里不必再解析、也不会在错误路径上抛新的异常。
+    relaunchEnabled = resolveRelaunchOnEgressFailure(
+      core.getInput("llm-relaunch-on-egress-failure")
+    );
+    maxRelaunches = resolveMaxRelaunches(core.getInput("llm-max-relaunches"));
 
     const apiKey = core.getInput("llm-api-key") || "ollama";
     const baseUrl = core.getInput("llm-base-url") || "";
     const model = core.getInput("model") || "";
+    llmModel = model;
     const failOnHigh = core.getInput("fail-on-high") === "true";
     const maxDiffSizeInput = core.getInput("max-diff-size") || "50000";
     const maxCommentsInput = core.getInput("max-comments") || "25";
@@ -402,10 +421,110 @@ async function run(): Promise<void> {
     if (octokit && statusOwner && statusRepo && statusCommentId) {
       await updateStatusComment(octokit, statusOwner, statusRepo, statusCommentId, buildFailedStatusBody(message, statusCommand));
     }
+    // 「换出口」放在失败状态评论之后：先让这一轮的结论落进评论（新 run 会继承），
+    // 再决定要不要另起一个 CI。反过来的话，新 run 继承到的就是一条还没写完的评论。
+    const relaunched =
+      octokit && statusPrNumber
+        ? await maybeRelaunchOnEgressFailure({
+            octokit,
+            owner: statusOwner,
+            repo: statusRepo,
+            prNumber: statusPrNumber,
+            error,
+            enabled: relaunchEnabled,
+            maxRelaunches,
+            model: llmModel,
+          })
+        : false;
+    // 已经发起重启的，这次 run 就该以失败告终：新 run 由
+    // `concurrency: cancel-in-progress` 把当前 run 取消掉，状态评论
+    // 会被认成 superseded，所以这里仍然照常 setFailed。
     core.setFailed(message);
+    if (relaunched) {
+      core.info("已发起换 CI；本次 run 将被新 run 取代。");
+    }
   } finally {
     onJobCancelled = undefined;
   }
+}
+
+/**
+ * 出口被 opencode 之类的网关阻断时：放弃当前 run，发一条 `/robin` 评论
+ * 让消费方 workflow 起一个新 run（换 runner = 换出口），并把上一轮的
+ * 评论继承过去。
+ *
+ * **永不抛出**。这一步的任何失败（列表评论 403、发评论 429、解析炸了……）
+ * 都只记 warning —— 它发生在错误路径上，抛出去会把「真正的失败原因」顶掉，
+ * 让人只看到一个无关紧要的 secondary failure。返回 true 表示评论已发出。
+ */
+async function maybeRelaunchOnEgressFailure(input: {
+  octokit: any;
+  owner: string;
+  repo: string;
+  prNumber: number;
+  error: unknown;
+  enabled: boolean;
+  maxRelaunches: number;
+  model: string;
+}): Promise<boolean> {
+  try {
+    const commentBodies = await listIssueCommentBodies(
+      input.octokit,
+      input.owner,
+      input.repo,
+      input.prNumber
+    );
+    const plan = planRelaunch({
+      enabled: input.enabled,
+      error: input.error,
+      commentBodies,
+      maxRelaunches: input.maxRelaunches,
+      model: input.model,
+    });
+    if (!plan.shouldPost || !plan.body) {
+      core.info(`不换出口：${plan.reason}`);
+      return false;
+    }
+    await input.octokit.rest.issues.createComment({
+      owner: input.owner,
+      repo: input.repo,
+      issue_number: input.prNumber,
+      body: plan.body,
+    });
+    core.info(plan.reason);
+    return true;
+  } catch (relaunchError) {
+    core.warning(
+      `换出口失败，退回为普通失败：${relaunchError instanceof Error ? relaunchError.message : String(relaunchError)}`
+    );
+    return false;
+  }
+}
+
+/**
+ * 列出 PR 上的全部评论正文，供 readPreviousHop 读回上一跳。
+ *
+ * 和 findLatestStatusComment 一样是 best-effort：列不出来就当没有历史
+ * （hop 0），这是安全的一侧 —— 最坏结果是多重启一次，而不是不重启。
+ */
+async function listIssueCommentBodies(
+  octokit: any,
+  owner: string,
+  repo: string,
+  issueNumber: number
+): Promise<string[]> {
+  const listComments = octokit?.rest?.issues?.listComments;
+  if (typeof octokit?.paginate !== "function" || !listComments) return [];
+  const comments = await octokit.paginate(listComments, {
+    owner,
+    repo,
+    issue_number: issueNumber,
+    per_page: 100,
+  });
+  if (!Array.isArray(comments)) return [];
+  return comments
+    .map((comment: any) => comment?.body)
+    .filter((body: unknown): body is string => typeof body === "string");
 }
 
 async function addEyesReaction(

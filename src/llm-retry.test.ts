@@ -1,6 +1,8 @@
 import {
   RETRY_JITTER_RATIO,
   computeRetryDelayMs,
+  isPermanentEgressFailure,
+  isTransientEgressFailure,
   getLlmCompletionAttemptCount,
   isInvalidReasoningEffortError,
   isOpenRouterRouterModel,
@@ -551,5 +553,99 @@ describe("isRetriableLlmError 的出口故障覆盖（R900）", () => {
       shallow = next;
     }
     expect(isRetriableLlmError(shallow)).toBe(true);
+  });
+});
+
+describe("出口故障的瞬时/永久分类（R914：决定要不要换一个新 CI）", () => {
+  // 「换出口」= 抛弃当前 run、另起一个新 CI 继续审查。这个谓词就是那个开关的闸门：
+  // 它必须比 isRetriableLlmError 更严，否则配错 base-url 会被无限重启 CI。
+  it("瞬时：值得换一个新 CI", () => {
+    const transient: unknown[] = [
+      new TypeError("fetch failed"),
+      Object.assign(new TypeError("fetch failed"), { cause: new Error("UND_ERR_SOCKET") }),
+      Object.assign(new TypeError("fetch failed"), { cause: new Error("socket hang up") }),
+      new Error("connect ETIMEDOUT 1.2.3.4:443"),
+      new Error("getaddrinfo EAI_AGAIN api.openai.com"),
+      new Error("read ECONNRESET"),
+      new Error("socket hang up"),
+      new Error("connect ECONNREFUSED 127.0.0.1:8080"),
+      Object.assign(new Error("Too Many Requests"), { status: 429 }),
+      Object.assign(new Error("boom"), { status: 500 }),
+      Object.assign(new Error("bad gateway"), { status: 502 }),
+      Object.assign(new Error("gateway timeout"), { status: 504 }),
+    ];
+    for (const err of transient) {
+      expect(isTransientEgressFailure(err)).toBe(true);
+    }
+  });
+
+  it("永久：换个 CI 也不会变好，不能拿去重启", () => {
+    const permanent: unknown[] = [
+      // 域名写错 —— 与瞬时的 EAI_AGAIN 刻意成对，后者必须仍判瞬时。
+      new Error("getaddrinfo ENOTFOUND api.openaai.com"),
+      new Error("request to https://x/ failed, reason: getaddrinfo ENOTFOUND"),
+      Object.assign(new Error("Invalid API key provided"), { status: 401 }),
+      Object.assign(new Error("bad request"), { status: 400 }),
+      Object.assign(new Error("forbidden"), { status: 403 }),
+      Object.assign(new Error("payload too large"), { status: 413 }),
+      new Error("model_not_found: gpt-nope"),
+      new Error("invalid_api_key"),
+      Object.assign(new TypeError("fetch failed"), { cause: new Error("UND_ERR_INVALID_URL") }),
+    ];
+    for (const err of permanent) {
+      expect(isTransientEgressFailure(err)).toBe(false);
+      expect(isPermanentEgressFailure(err)).toBe(true);
+    }
+  });
+
+  it("内容层空响应不是出口故障（run 内重试有意义，换 CI 换运气没意义）", () => {
+    expect(isTransientEgressFailure(new Error("empty response from llm"))).toBe(true);
+  });
+
+  it("OpenRouter 路由模型的 404 仍是瞬时（路由会换后端）", () => {
+    const err = Object.assign(new Error("Not Found"), { status: 404 });
+    expect(isPermanentEgressFailure(err, { model: "openrouter/free" })).toBe(false);
+    expect(isTransientEgressFailure(err, { model: "openrouter/free" })).toBe(true);
+    // 同一个 404，非路由模型就是永久的（模型名写错）。
+    expect(isPermanentEgressFailure(err, { model: "gpt-4o" })).toBe(true);
+    expect(isTransientEgressFailure(err, { model: "gpt-4o" })).toBe(false);
+  });
+
+  it("EAI_AGAIN 与 ENOTFOUND 是两回事，前者瞬时后者永久", () => {
+    expect(isTransientEgressFailure(new Error("getaddrinfo EAI_AGAIN a.com"))).toBe(true);
+    expect(isTransientEgressFailure(new Error("getaddrinfo ENOTFOUND a.com"))).toBe(false);
+  });
+
+  it("und_err 家族按子类型分开：SOCKET 瞬时、INVALID_URL 永久", () => {
+    expect(isTransientEgressFailure(new Error("UND_ERR_SOCKET"))).toBe(true);
+    expect(isTransientEgressFailure(new Error("UND_ERR_INVALID_URL"))).toBe(false);
+  });
+
+  it("429 限流必须判瞬时（R917 回归钉子）", () => {
+    // 回归钉子：曾把「4xx 一律判永久」写成不带例外的规则，429 因此被误判成
+    // 「换 CI 也没用」—— 而限流恰恰是最该换 IP/换 runner 重试的场景，
+    // 等于让换出口在最需要时失灵。
+    const err = Object.assign(new Error("status 429"), { status: 429 });
+    expect(isPermanentEgressFailure(err)).toBe(false);
+    expect(isRetriableLlmError(err)).toBe(true);
+    expect(isTransientEgressFailure(err)).toBe(true);
+  });
+
+  it("408 跟随上游「不重试」判定，因而不瞬时（R918 如实记录该耦合）", () => {
+    // isTransientEgressFailure 以 isRetriableLlmError 为前提。isRetriableLlmError
+    // 对 408 返回 false（408 既非 429、非 >=500、非路由 404，落入「4xx 一律不重试」），
+    // 所以 408 不会触发换 CI。这是对上游既有判定的跟随，不是本层新增的取舍 ——
+    // 换出口的闸门比 run 内重试更保守，两者不应各判各的。
+    const err = Object.assign(new Error("status 408"), { status: 408 });
+    expect(isRetriableLlmError(err)).toBe(false);
+    expect(isTransientEgressFailure(err)).toBe(false);
+    // 前向防御：即便上游日后让 408 可重试，分类器也不该把它误判成「永久」。
+    expect(isPermanentEgressFailure(err)).toBe(false);
+  });
+
+  it("空值与非错误不会误判为瞬时", () => {
+    expect(isTransientEgressFailure(undefined)).toBe(false);
+    expect(isTransientEgressFailure(null)).toBe(false);
+    expect(isPermanentEgressFailure(undefined)).toBe(false);
   });
 });

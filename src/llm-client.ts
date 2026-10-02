@@ -142,7 +142,9 @@ export class LLMClient {
 
         if (!isRetriableLlmError(error, this.retryContext()) || attempt === this.maxAttempts) {
           core.error(`LLM API error: ${error}`);
-          throw new Error(`Failed to get response from LLM: ${error}`);
+          // 保留 cause：包装后 status 与完整错误链会丢，
+          // 上层要靠它判断「是不是出口瞬时故障、该不该换个 CI 继续审查」。
+          throw new Error(`Failed to get response from LLM: ${error}`, { cause: error });
         }
       }
 
@@ -157,13 +159,22 @@ export class LLMClient {
       }
     }
 
-    if (lastError && isRetriableLlmError(lastError, this.retryContext())) {
+    // 只看 lastError 是否存在，不再重算 isRetriableLlmError：
+    // 能走到这里说明所有 attempt 都没在 catch 里抛出（:143 已经把不可重试的
+    // 错误抛出去了），所以 lastError 必然是可重试的那个。重算谓词既冗余，
+    // 又会在谓词日后变得依赖运行时状态时把真实的 API 错误误报成
+    // 「空响应」——那会让上层连"要不要换 CI"都判错。
+    if (lastError) {
       core.error(`LLM API error after ${this.maxAttempts} attempts: ${lastError}`);
       throw new Error(
-        `Failed to get response from LLM after ${this.maxAttempts} attempts: ${lastError}`
+        `Failed to get response from LLM after ${this.maxAttempts} attempts: ${lastError}`,
+        { cause: lastError }
       );
     }
 
+    // 这里**故意不挂 cause**：走到这个分支意味着每次 attempt 都正常返回了
+    // HTTP 响应、只是正文为空（finish_reason 记在消息里），根本没有底层
+    // 异常可挂。硬造一个 cause 只会污染错误链、误导上层分类器。
     throw new Error(
       `Empty response from LLM after ${this.maxAttempts} attempts (finish_reason=${lastFinishReason})`
     );

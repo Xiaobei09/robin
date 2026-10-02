@@ -48,6 +48,14 @@ inputs:
     description: "Maximum attempts per LLM completion request. Default is 3, and 5 for OpenRouter free-router models. Raise it when the provider intermittently drops connections or returns 5xx; set to 1 to disable retries. Leave empty to keep the built-in default."
     required: false
     default: ""
+  llm-relaunch-on-egress-failure:
+    description: "When a transient LLM egress failure blocks the review, abandon this CI run and start a fresh one (a new runner means a new egress path) by posting a /robin comment, carrying the previous round's comments over. Default is true. Set to false to fail immediately instead — useful when CI minutes are precious or the outage is expected to outlast a restart."
+    required: false
+    default: "true"
+  llm-max-relaunches:
+    description: "Maximum number of times one review may be relaunched on a fresh CI because of transient LLM egress failures. Default is 2. 0 disables relaunching entirely. Invalid values fall back to the default; negative values are treated as 0."
+    required: false
+    default: ""
   llm-temperature:
     description: "Sampling temperature for LLM requests, between 0 and 2. Default is 0.1 for near-deterministic reviews. Some models only accept a fixed value (for example Kimi requires 1)."
     required: false

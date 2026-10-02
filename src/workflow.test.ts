@@ -36,7 +36,13 @@ const WORKFLOW_ONLY_INPUTS = new Set(["runner"]);
  * - use-json-response-mode: string, default ""
  */
 const DEFER_BOOLEAN_NO_DEFAULT = ["request-changes"] as const;
-const DEFER_STRING_EMPTY_DEFAULT = ["use-json-response-mode", "llm-max-attempts"] as const;
+const DEFER_STRING_EMPTY_DEFAULT = [
+  "use-json-response-mode",
+  "llm-max-attempts",
+  // llm-max-relaunches 空值 ≠ 0：空表示"用 action 默认的 2"，0 表示"彻底不重启"。
+  // 若在 workflow 上强行给 0，action.yml 里的 default 就永远到不了。
+  "llm-max-relaunches",
+] as const;
 
 function parseActionInputs(source: string): string[] {
   // Scope to the inputs: section so a future outputs: block cannot pollute parity.

@@ -196,15 +196,18 @@ export function isRetriableLlmError(error: unknown, context: LlmRetryContext = {
 
   const routerModel = isOpenRouterRouterModel(context.model);
 
-  if (typeof error === "object" && error !== null && "status" in error) {
-    const status = Number((error as { status?: number }).status);
-    if (status === 429 || (Number.isFinite(status) && status >= 500)) {
+  // 统一走 llmErrorStatus：它会沿 cause 链找 status。早先这里内联了一份
+  // 「只看顶层 status」的读取，与 isPermanentEgressFailure 各写各的，结果两边
+  // 在真实调用路径（错误已被 llm-client 包装）上都读不到 provider 的状态码。
+  const status = llmErrorStatus(error);
+  if (status !== undefined) {
+    if (status === 429 || status >= 500) {
       return true;
     }
     if (status === 404 && routerModel) {
       return true;
     }
-    if (Number.isFinite(status) && status >= 400 && status < 500) {
+    if (status >= 400 && status < 500) {
       return false;
     }
   }
@@ -236,6 +239,105 @@ export function isRetriableLlmError(error: unknown, context: LlmRetryContext = {
     message.includes("epipe") ||
     message.includes("und_err")
   );
+}
+
+/**
+ * 永久性出口故障的特征词。
+ *
+ * 与 `isRetriableLlmError` 刻意分开：那个谓词管「同一次 run 内还要不要再试一次」，
+ * 成本只是几次 attempt，所以对「域名写错」这类错误也宽容。这个谓词管
+ * 「要不要抛弃这个 CI、另起一个新 CI」—— 成本是整条流水线，绝不能被永久性配置错误
+ * 触发，否则配错一次 base-url 就会变成无限重启 CI。
+ */
+const PERMANENT_EGRESS_KEYWORDS = [
+  // DNS 明确报「主机不存在」：域名写错或该主机已下线，换几次 runner 都不会变。
+  // 注意必须与瞬时的 eai_again（DNS 暂时失败）区分开，两者都是 getaddrinfo 家族。
+  "enotfound",
+  "und_err_invalid_url",
+  "invalid_api_key",
+  "incorrect api key",
+  "unauthorized",
+  "forbidden",
+  "model_not_found",
+  "unknown model",
+  "no such model",
+  "does not support",
+];
+
+/**
+ * 这些 4xx 看着像「客户端错误」，实际却是**瞬时**的。
+ *
+ * 429 限流尤其关键：它是最该「换个 CI（换 IP/换 runner）重试」的典型场景，
+ * 绝不能被当成「换几次都没用的配置错误」—— 那会让换出口这个功能在最需要时失灵。
+ * 408 是服务端等请求等超时，同理。
+ */
+const TRANSIENT_CLIENT_STATUSES = new Set([408, 429]);
+
+/**
+ * 取出错误链上的 HTTP 状态码；没有就返回 undefined（连接层错误没有 status）。
+ *
+ * **必须沿 cause 链往上找**。调用方（`main.ts` 的 catch）拿到的是
+ * `llm-client.ts` 包装过的错误，真正的 provider 错误挂在 `cause` 上、
+ * `status` 也只挂在那一层。只看顶层的话，生产路径上 `status` 恒为 undefined，
+ * 下面所有按状态码分类的规则（429/408 瞬时、4xx 永久、5xx 可重试）全部是死代码 ——
+ * 而单测直接喂原始错误，恰好把这个洞盖住了（R926）。
+ *
+ * 遍历方式与 `errorTextChain` 一致：限深 + 防环。
+ */
+function llmErrorStatus(error: unknown): number | undefined {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; depth < MAX_ERROR_CAUSE_DEPTH && current != null; depth++) {
+    if (typeof current === "object" || typeof current === "function") {
+      if (seen.has(current)) break;
+      seen.add(current);
+    }
+    if (typeof current === "object" && "status" in current) {
+      const status = Number((current as { status?: number }).status);
+      if (Number.isFinite(status)) return status;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/**
+ * 这个错误是否「换一个 CI run 也不会变好」。
+ *
+ * 命中即表示：不该拿它去触发重新跑一个 CI。
+ */
+export function isPermanentEgressFailure(
+  error: unknown,
+  context: LlmRetryContext = {},
+): boolean {
+  if (!error) return false;
+
+  const routerModel = isOpenRouterRouterModel(context.model);
+  const status = llmErrorStatus(error);
+
+  if (status !== undefined && status >= 400 && status < 500) {
+    if (TRANSIENT_CLIENT_STATUSES.has(status)) return false;
+    // OpenRouter 路由模型报 404 是「这个后端暂时没这个模型」，路由会换后端，属瞬时。
+    if (!(status === 404 && routerModel)) return true;
+  }
+
+  const message = errorTextChain(error);
+  return PERMANENT_EGRESS_KEYWORDS.some((keyword) => message.includes(keyword));
+}
+
+/**
+ * 出口是否处于**瞬时**故障：值得抛弃当前 CI、另起一个新 CI 继续审查。
+ *
+ * 必须同时满足「可重试」（确实是故障，不是配置错）与「非永久」
+ * （换个 run 有机会好）。注意它与 `isRetriableLlmError` 是**两个独立决策**，
+ * 后者更宽松，前者更严格。
+ */
+export function isTransientEgressFailure(
+  error: unknown,
+  context: LlmRetryContext = {},
+): boolean {
+  if (!isRetriableLlmError(error, context)) return false;
+  return !isPermanentEgressFailure(error, context);
 }
 
 export function shouldUseJsonResponseMode(
