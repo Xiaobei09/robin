@@ -1600,6 +1600,37 @@ async function run() {
                 parsedReview = review_parser_1.ReviewParser.parseDetailed(retryText);
                 findings = parsedReview.findings;
             }
+            // R927：模型解析失败也换 CI（与 egress 瞬时故障同一 hop 上限）。
+            // 触发面收窄到「两次都没能产出 JSON」：usedJson==false 且 0 条发现。
+            // JSON 合法但 findings 为空（usedJson==true）是干净 PR 的正常形态，绝不能重开。
+            {
+                const count = findings.high.length +
+                    findings.medium.length +
+                    findings.low.length +
+                    findings.suggestions.length;
+                if (count === 0 && !parsedReview.usedJson) {
+                    const parseErr = new Error("empty response from llm: review unparsable after retry (no JSON object found)");
+                    const msg = parseErr.message;
+                    await updateStatusComment(octokit, owner, repo, statusCommentId, buildFailedStatusBody(msg, statusCommand));
+                    const relaunchedParse = octokit && statusPrNumber
+                        ? await maybeRelaunchOnEgressFailure({
+                            octokit,
+                            owner: statusOwner,
+                            repo: statusRepo,
+                            prNumber: statusPrNumber,
+                            error: parseErr,
+                            enabled: relaunchEnabled,
+                            maxRelaunches,
+                            model: llmModel,
+                        })
+                        : false;
+                    core.setFailed(msg);
+                    if (relaunchedParse) {
+                        core.info("已发起换 CI；本次 run 将被新 run 取代。");
+                    }
+                    return;
+                }
+            }
             core.info(`Found ${findings.high.length} high, ${findings.medium.length} medium, ${findings.low.length} low, ${findings.suggestions.length} suggestions`);
             const reviewer = new github_reviewer_1.GitHubReviewer(octokit, maxComments);
             await reviewer.postReview(owner, repo, prNumber, findings, requestChanges);
