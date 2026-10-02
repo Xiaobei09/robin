@@ -13,6 +13,7 @@ import {
   resolveRelaunchOnEgressFailure,
   DEFAULT_MAX_RELAUNCHES,
 } from "./relaunch";
+import { AVAILABLE_COMMANDS, parseSlashCommand } from "./commands";
 
 describe("换出口 = 抛弃当前 CI，另起一个新 CI（R922）", () => {
   it("默认开启，且默认最多重启 2 次", () => {
@@ -513,5 +514,40 @@ describe("换出口 = 抛弃当前 CI，另起一个新 CI（R922）", () => {
       expect(call).not.toBeNull();
       expect(call![0]).toMatch(/^\s*headSha,\s*$/m);
     });
+  });
+});
+
+/**
+ * R943：`RELAUNCH_COMMAND` 是换 CI 机制唯一的触发面，却是个裸字面量。
+ *
+ * 整套「抛弃当前 CI、另起一个新 CI」靠的是：Robin 发一条 `/robin` 评论，
+ * 消费方 workflow 的 `issue_comment` + job-if 认得它才会起新 run。
+ * 而 job-if 里那份命令清单是硬编码的（见 workflow.test.ts 的 job-if 断言）。
+ *
+ * 两边没有任何断言 tying 在一起。所以完全可能发生：
+ * 有人把 `/robin` 从 job-if 里去掉、或者改了别名解析，
+ * `RELAUNCH_COMMAND` 这边**编译通过、单测全绿**，
+ * 而线上重开功能已经彻底失效 —— 每次瞬时错误都只是失败，没人知道为什么。
+ *
+ * 这正是「helper 有单测 ≠ 接线正确」那一族（第 6 次现身）：断言必须比对
+ * 两份**实际生产**的值，而不是各自测各自的。
+ */
+describe("换 CI 的触发命令必须是真命令（R943）", () => {
+  const entry = AVAILABLE_COMMANDS.find((c) => c.command === RELAUNCH_COMMAND);
+
+  it("RELAUNCH_COMMAND 在权威清单里，且归一化成 review", () => {
+    expect(entry).toBeDefined();
+    expect(entry?.mapsTo).toBe("review");
+  });
+
+  it("RELAUNCH_COMMAND 真的能被 parseSlashCommand 解析成 review", () => {
+    expect(parseSlashCommand(RELAUNCH_COMMAND)).toBe("review");
+  });
+
+  it("RELAUNCH_COMMAND 是消费方 job-if 会认得的命令", () => {
+    // 不能在这里读 review.yml（那是 workflow.test.ts 的职责），但至少保证
+    // 它是清单成员 —— 配合 workflow.test.ts 的 job-if 断言，两者合起来
+    // 才能推出「Robin 发的这条评论一定能让 workflow 起 run」。
+    expect(AVAILABLE_COMMANDS.map((c) => c.command)).toContain(RELAUNCH_COMMAND);
   });
 });
