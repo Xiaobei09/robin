@@ -1,6 +1,7 @@
 import {
   RETRY_JITTER_RATIO,
   computeRetryDelayMs,
+  errorMessage,
   isPermanentEgressFailure,
   isTransientEgressFailure,
   getLlmCompletionAttemptCount,
@@ -647,5 +648,85 @@ describe("出口故障的瞬时/永久分类（R914：决定要不要换一个�
     expect(isTransientEgressFailure(undefined)).toBe(false);
     expect(isTransientEgressFailure(null)).toBe(false);
     expect(isPermanentEgressFailure(undefined)).toBe(false);
+  });
+
+  // R939：生产实证 SiliconMod/Silicon#67（run 36585231278）留下了一条
+  // 「Reason: 」后面什么都没有的失败评论。维护者看到这种评论只能推断
+  // 「Robin 挂了」，而挂掉的原因恰恰是最该被解释的那件事。
+  describe("errorMessage：错误摘要必须真的说清楚出了什么事", () => {
+    it("空 message 必须兜底，绝不能渲染成空的 Reason 行（生产回归）", () => {
+      const blank = new Error("");
+      expect(blank.message).toBe(""); // 前提：这确实是空串
+      const text = errorMessage(blank);
+      expect(text).not.toBe("");
+      expect(text.trim()).toBe(text);
+      expect(text.length).toBeGreaterThan(0);
+    });
+
+    it("message 为 undefined 的 Error 也不能变空", () => {
+      expect(errorMessage(new Error(undefined as unknown as string)).trim()).not.toBe("");
+    });
+
+    it("优先带上 response.data.message —— 那才是有用的那一半", () => {
+      // 复现生产那次：octokit RequestError 的壳只有状态码
+      const err = Object.assign(new Error("Request failed due to error response: 403"), {
+        name: "HttpError",
+        response: {
+          status: 403,
+          data: { message: "Resource not accessible by integration" },
+        },
+      });
+      const text = errorMessage(err);
+      expect(text).toContain("Resource not accessible by integration");
+      // 状态码也要留：403 与 404 指向完全不同的排查方向
+      expect(text).toContain("403");
+    });
+
+    it("绝不整体序列化 response.data —— 那会把凭据写进公开的 PR 评论", () => {
+      const err = Object.assign(new Error("Bad credentials"), {
+        response: {
+          data: {
+            // **secret 必须排在 message 前面**：M14 变异（把白名单换成
+            // Object.keys 全遍历）在 message 靠后时会先返回 message 而看起来
+            // 通过 —— 实测那样会让「secret 在前」的组合真的泄漏。
+            // 插入序才是判据，所以这里刻意按最坏顺序摆。
+            client_secret: "cs_SUPERSECRET",
+            access_token: "at_SUPERSECRET",
+            message: "Bad credentials",
+          },
+        },
+      });
+      const text = errorMessage(err);
+      expect(text).not.toContain("SUPERSECRET");
+      expect(text).not.toContain("client_secret");
+      expect(text).not.toContain("access_token");
+      // 但白名单字段该留
+      expect(text).toContain("Bad credentials");
+    });
+
+    it("输出必须是单行：换行会破坏 `Reason: ` 那一行的可读性", () => {
+      const err = new Error("line one\nline two\r\nline three");
+      const text = errorMessage(err);
+      expect(text).not.toMatch(/[\r\n]/);
+    });
+
+    it("超长原文截断（评论不是日志）", () => {
+      const text = errorMessage(new Error("x".repeat(5000)));
+      expect(text.length).toBeLessThanOrEqual(400);
+      expect(text.endsWith("…")).toBe(true);
+    });
+
+    it("非 Error 的抛出物照旧能给出内容", () => {
+      expect(errorMessage("plain string")).toBe("plain string");
+      expect(errorMessage({ message: "obj with message" })).toBe("obj with message");
+      expect(errorMessage(123)).toBe("123");
+    });
+
+    it("response.data 里没有白名单字段时不产出多余分隔符", () => {
+      const err = Object.assign(new Error("boom"), {
+        response: { data: { unrelated: "x" } },
+      });
+      expect(errorMessage(err)).toBe("boom");
+    });
   });
 });

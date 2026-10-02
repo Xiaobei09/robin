@@ -32,16 +32,78 @@ export function isOpenRouterProviderError(error: unknown): boolean {
   return message.includes("provider returned error");
 }
 
+/**
+ * 人类可读的错误摘要。
+ *
+ * 三件事在这里收口，因为它们都直接影响「维护者能不能自查」：
+ *
+ * 1. **空 message 必须兜底。** 生产实证（SiliconMod/Silicon#67，run 36585231278）：
+ *    一条 `Reason: ` 后面什么都没有的失败评论。`new Error("")` 的 message 是空串，
+ *    `instanceof Error` 分支会把它原样返回，于是评论里那行等于不存在 ——
+ *    而这恰恰是最需要解释的一次失败。
+ *
+ * 2. **优先取 `response.data.message`。** octokit 的 `RequestError.message` 只有
+ *    `Request failed due to error response: 403` 这种壳，真正的原因在
+ *    `response.data.message`（例如 `Resource not accessible by integration`，
+ *    正是 fork PR token 被降级成只读时的那个）。不取的话日志只能看到状态码，
+ *    而「为什么是 403」这个唯一有用的信息被丢掉了。
+ *
+ * 3. **body 里可能夹带凭据。** `response.data` 在 OAuth 错误等分支里会带
+ *    `client_secret` / `access_token`。这里**只取白名单字段**，绝不整体序列化
+ *    response —— 这些文本会进 PR 评论（公开），而评论那行还写着
+ *    "No secrets are included in this message"。
+ *
+ * 输出单行：换行会被 markdown 折行渲染成多行，破坏 `Reason: ` 那一行的可读性。
+ */
 export function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  if (
-    typeof error === "object" &&
-    error !== null &&
-    typeof (error as { message?: unknown }).message === "string"
-  ) {
-    return (error as { message: string }).message;
+  const raw =
+    error instanceof Error
+      ? error.message
+      : typeof error === "object" &&
+          error !== null &&
+          typeof (error as { message?: unknown }).message === "string"
+        ? (error as { message: string }).message
+        : String(error);
+
+  const detail = extractResponseDetail(error);
+  const combined = [raw, detail].filter((part) => part && part.trim()).join(": ");
+  // 单行化：评论正文里换行会让 `Reason: ` 那一行读起来断掉。
+  const single = combined.replace(/\s+/g, " ").trim();
+  if (single) return truncate(single, MAX_ERROR_MESSAGE_CHARS);
+
+  // 兜底：宁可给一个明确无信息量的占位，也不要留空 —— 空的那行会让
+  // 这次失败看起来像「Robin 什么都没做就挂了」。
+  const name = error instanceof Error ? error.name : undefined;
+  return name && name !== "Error"
+    ? `${name} (no message)`
+    : "unknown error (no message)";
+}
+
+/** 上限：评论正文不是日志，超长原文没有阅读价值，还会把评论撑得很难看。 */
+const MAX_ERROR_MESSAGE_CHARS = 400;
+
+/**
+ * 从 HTTP 错误里取出**白名单**的诊断字段。
+ *
+ * 刻意只认这几个 key：它们是 GitHub 错误体的固定结构，且不含凭据。
+ * 整个 `response.data` 绝不能被序列化进 PR 评论。
+ */
+function extractResponseDetail(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const response = (error as { response?: unknown }).response;
+  if (typeof response !== "object" || response === null) return undefined;
+  const data = (response as { data?: unknown }).data;
+  if (typeof data !== "object" || data === null) return undefined;
+  const record = data as Record<string, unknown>;
+  for (const key of ["message", "error_description", "documentation_url"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
   }
-  return String(error);
+  return undefined;
+}
+
+function truncate(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 }
 
 /**
