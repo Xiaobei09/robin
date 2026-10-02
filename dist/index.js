@@ -52,9 +52,10 @@ function hasRequiredPermission(permission, minimumPermission) {
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.MAX_LLM_TEMPERATURE = exports.DEFAULT_LLM_TEMPERATURE = exports.DEFAULT_LLM_ROUTER_RETRY_DELAY_MS = exports.DEFAULT_LLM_RETRY_DELAY_MS = exports.DEFAULT_LLM_ROUTER_COMPLETION_ATTEMPTS = exports.DEFAULT_LLM_COMPLETION_ATTEMPTS = exports.DEFAULT_LLM_ROUTER_FIRST_CHUNK_MS = exports.DEFAULT_LLM_ROUTER_TIMEOUT_MS = exports.DEFAULT_LLM_TIMEOUT_MS = void 0;
+exports.MAX_LLM_COMPLETION_ATTEMPTS = exports.MIN_LLM_COMPLETION_ATTEMPTS = exports.MAX_LLM_TEMPERATURE = exports.DEFAULT_LLM_TEMPERATURE = exports.DEFAULT_LLM_ROUTER_RETRY_DELAY_MS = exports.DEFAULT_LLM_RETRY_DELAY_MS = exports.DEFAULT_LLM_ROUTER_COMPLETION_ATTEMPTS = exports.DEFAULT_LLM_COMPLETION_ATTEMPTS = exports.DEFAULT_LLM_ROUTER_FIRST_CHUNK_MS = exports.DEFAULT_LLM_ROUTER_TIMEOUT_MS = exports.DEFAULT_LLM_TIMEOUT_MS = void 0;
 exports.parseLLMTimeout = parseLLMTimeout;
 exports.parseLLMTemperature = parseLLMTemperature;
+exports.parseLLMMaxAttempts = parseLLMMaxAttempts;
 exports.DEFAULT_LLM_TIMEOUT_MS = 600000; // 10 minutes
 exports.DEFAULT_LLM_ROUTER_TIMEOUT_MS = 120000; // 2 minutes — openrouter/free happy path is ~60-90s
 exports.DEFAULT_LLM_ROUTER_FIRST_CHUNK_MS = 45000; // no SSE = stacked router; fail fast and retry
@@ -84,6 +85,35 @@ function parseLLMTemperature(input) {
         return { value: parsed, valid: true };
     }
     return { value: exports.DEFAULT_LLM_TEMPERATURE, valid: false };
+}
+/** Bounds for the optional `llm-max-attempts` input.
+ *  1 disables LLM retries entirely; the ceiling stops a mistyped workflow from
+ *  hammering the provider for the whole job budget. */
+exports.MIN_LLM_COMPLETION_ATTEMPTS = 1;
+exports.MAX_LLM_COMPLETION_ATTEMPTS = 10;
+/**
+ * Parse the optional `llm-max-attempts` action input.
+ *
+ * `value: undefined` means "not configured" and is deliberately distinct from a
+ * number: passing it through to `LLMClient` keeps the constructor default
+ * (`DEFAULT_LLM_COMPLETION_ATTEMPTS`), which in turn keeps
+ * `getLlmCompletionAttemptCount`'s OpenRouter exception (5 attempts for
+ * `openrouter/…/free` models) intact. Returning a concrete fallback number here
+ * would silently disable that exception, so an unparseable input yields
+ * `undefined` + `valid:false` and the caller only warns.
+ */
+function parseLLMMaxAttempts(input) {
+    const trimmed = input.trim();
+    if (!trimmed)
+        return { value: undefined, valid: true };
+    const parsed = Number(trimmed);
+    // Integer check: "2.5" attempts is meaningless, and Math.floor would hide a typo.
+    if (Number.isInteger(parsed) &&
+        parsed >= exports.MIN_LLM_COMPLETION_ATTEMPTS &&
+        parsed <= exports.MAX_LLM_COMPLETION_ATTEMPTS) {
+        return { value: parsed, valid: true };
+    }
+    return { value: undefined, valid: false };
 }
 //# sourceMappingURL=config.js.map
 
@@ -1190,6 +1220,7 @@ const git_utils_1 = __nccwpck_require__(8529);
 const review_parser_1 = __nccwpck_require__(2141);
 const review_retry_1 = __nccwpck_require__(450);
 const github_reviewer_1 = __nccwpck_require__(268);
+const status_comment_1 = __nccwpck_require__(3523);
 const config_1 = __nccwpck_require__(4008);
 const diff_filter_1 = __nccwpck_require__(7561);
 const diff_annotate_1 = __nccwpck_require__(4523);
@@ -1284,6 +1315,15 @@ async function run() {
         if (!llmTemperatureValid) {
             core.warning(`Invalid llm-temperature value "${llmTemperatureInput}", using default ${config_1.DEFAULT_LLM_TEMPERATURE}`);
         }
+        // "Not configured" (empty / unparseable) resolves to undefined so the LLMClient
+        // constructor default applies, which keeps getLlmCompletionAttemptCount's
+        // OpenRouter free-router exception (5 attempts) intact.
+        const llmMaxAttemptsInput = core.getInput("llm-max-attempts") || "";
+        const { value: llmMaxAttempts, valid: llmMaxAttemptsValid } = (0, config_1.parseLLMMaxAttempts)(llmMaxAttemptsInput);
+        if (!llmMaxAttemptsValid) {
+            core.warning(`Invalid llm-max-attempts value "${llmMaxAttemptsInput}" ` +
+                `(expected an integer 1-10); using the built-in default`);
+        }
         const inlineReviewInstructions = core.getInput("review-instructions") || "";
         const reviewInstructionsFile = core.getInput("review-instructions-file") || "";
         const configFile = core.getInput("config-file") || repo_config_1.DEFAULT_CONFIG_FILE;
@@ -1293,7 +1333,7 @@ async function run() {
         core.info(`Running /${command} on PR #${prNumber} in ${owner}/${repo}`);
         statusCommand = command === "summary" ? "summary" : "review";
         statusModel = model || "not configured";
-        statusCommentId = await postStatusComment(octokit, owner, repo, prNumber, command, statusModel);
+        statusCommentId = await resolveStatusCommentId(octokit, owner, repo, prNumber, command, statusModel);
         onJobCancelled = async () => {
             if (octokit && statusCommentId) {
                 // The SIGTERM grace period is short — never let the superseded check
@@ -1359,7 +1399,7 @@ async function run() {
         const reviewInstructions = command === "review"
             ? await loadReviewInstructions(octokit, gitUtils, owner, repo, prNumber, inlineReviewInstructions, reviewInstructionsFile, baseRef)
             : "";
-        const llm = new llm_client_1.LLMClient(baseUrl, apiKey, model, maxOutputTokens, llmTimeoutMs, undefined, llmTemperature, async (detail) => {
+        const llm = new llm_client_1.LLMClient(baseUrl, apiKey, model, maxOutputTokens, llmTimeoutMs, llmMaxAttempts, llmTemperature, async (detail) => {
             await updateStatusComment(octokit, owner, repo, statusCommentId, buildProgressStatusBody(detail, statusCommand, statusModel));
         }, reasoningEffort);
         const useJsonMode = command === "review" && jsonResponseMode;
@@ -1429,20 +1469,13 @@ async function addEyesReaction(octokit, owner, repo, commentId) {
         core.warning(`Could not add eyes reaction to trigger comment: ${error}`);
     }
 }
-async function postStatusComment(octokit, owner, repo, issueNumber, command, model) {
+async function postStatusComment(octokit, owner, repo, issueNumber, command, model, inheritedVerdict) {
     try {
         const { data } = await octokit.rest.issues.createComment({
             owner,
             repo,
             issue_number: issueNumber,
-            body: [
-                "## " + github_reviewer_1.ROBIN_SIGNATURE,
-                "",
-                ":eyes: On it — taking a look at this pull request.",
-                "",
-                `Mode: ${command === "summary" ? "summary" : "code review"}`,
-                `Model: ${model}`,
-            ].join("\n"),
+            body: (0, status_comment_1.decorateStatusCommentBody)((0, status_comment_1.buildInitialStatusBody)(command === "summary" ? "summary" : "review", model, inheritedVerdict)),
         });
         return data.id;
     }
@@ -1459,12 +1492,31 @@ async function updateStatusComment(octokit, owner, repo, commentId, body) {
             owner,
             repo,
             comment_id: commentId,
-            body,
+            body: (0, status_comment_1.decorateStatusCommentBody)(body),
         });
     }
     catch (error) {
         core.warning(`Could not update status comment: ${error}`);
     }
+}
+/**
+ * Reuse the previous run's status comment when there is one.
+ *
+ * Every run used to create a fresh comment, so a PR reviewed several times carried several
+ * "On it" comments and the newest could scroll out of view. A retried run now updates the
+ * existing comment in place and carries the previous verdict forward, so the evaluation the
+ * reader could already see is inherited instead of vanishing the moment a retry starts.
+ */
+async function resolveStatusCommentId(octokit, owner, repo, issueNumber, command, model) {
+    const existing = await (0, status_comment_1.findLatestStatusComment)(octokit, owner, repo, issueNumber);
+    if (!existing) {
+        return postStatusComment(octokit, owner, repo, issueNumber, command, model);
+    }
+    const inheritedVerdict = (0, status_comment_1.extractInheritedVerdict)(existing.body);
+    core.info(`Adopting Robin status comment #${existing.id} from a previous run` +
+        (inheritedVerdict ? ` (carrying over: ${inheritedVerdict})` : ""));
+    await updateStatusComment(octokit, owner, repo, existing.id, (0, status_comment_1.buildInitialStatusBody)(command === "summary" ? "summary" : "review", model, inheritedVerdict));
+    return existing.id;
 }
 function buildCompletedStatusBody(command, findings, reasoningFallbackReason) {
     const fallbackNotice = (0, reasoning_fallback_1.buildReasoningFallbackNotice)(reasoningFallbackReason);
@@ -2301,6 +2353,113 @@ function shouldRetryStructuredReview(findings, usedJson) {
     return findings.summary.trim().length <= RETRY_SUMMARY_MAX_LENGTH;
 }
 //# sourceMappingURL=review-retry.js.map
+
+/***/ }),
+
+/***/ 3523:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/**
+ * Helpers for Robin's PR status comment.
+ *
+ * Two problems are solved here.
+ *
+ * 1. Comment pile-up. Every run used to `createComment` a fresh status comment, so a PR
+ *    that was reviewed five times carried five "On it" comments and the newest one could
+ *    scroll out of view, leaving the reader unsure whether the bot was still working.
+ *    Status comments now carry an invisible marker and a new run *adopts* the most recent
+ *    marked comment instead of creating another one.
+ *
+ * 2. Lost verdicts. Adopting a comment means overwriting the previous run's status, so the
+ *    previous verdict would disappear from the PR the moment a retry started. Every status
+ *    body therefore keeps a human-readable "Last result:" line, and the next run carries it
+ *    forward. The line is scanned from the *end* so that a third run still finds the
+ *    original verdict rather than re-inheriting its own copy.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.LAST_RESULT_PREFIX = exports.STATUS_COMMENT_MARKER = void 0;
+exports.decorateStatusCommentBody = decorateStatusCommentBody;
+exports.extractInheritedVerdict = extractInheritedVerdict;
+exports.buildInitialStatusBody = buildInitialStatusBody;
+exports.findLatestStatusComment = findLatestStatusComment;
+/** Invisible marker that identifies a comment as Robin's status comment (never the review). */
+exports.STATUS_COMMENT_MARKER = "<!-- robin:status -->";
+/** Prefix of the line that carries the previous run's verdict forward. */
+exports.LAST_RESULT_PREFIX = "> **Last result:** ";
+/** Append the invisible marker to a status body. Idempotent. */
+function decorateStatusCommentBody(body) {
+    return body.includes(exports.STATUS_COMMENT_MARKER) ? body : `${body}\n\n${exports.STATUS_COMMENT_MARKER}`;
+}
+/**
+ * The most recent inherited verdict recorded in a status body, or undefined.
+ *
+ * Scans for the *last* occurrence: once run 2 has inherited run 1's verdict the body holds
+ * two lines, and re-inheriting run 2's own copy would keep the value stable across runs.
+ */
+function extractInheritedVerdict(body) {
+    if (typeof body !== "string")
+        return undefined;
+    const lines = body.split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (line.startsWith(exports.LAST_RESULT_PREFIX) && line.length > exports.LAST_RESULT_PREFIX.length) {
+            return line.slice(exports.LAST_RESULT_PREFIX.length).trim();
+        }
+    }
+    return undefined;
+}
+/** The "On it" status body posted at the start of a run, optionally carrying a prior verdict. */
+function buildInitialStatusBody(command, model, inheritedVerdict) {
+    return [
+        "## :bow_and_arrow: Robin",
+        "",
+        ":eyes: On it — taking a look at this pull request.",
+        "",
+        ...(inheritedVerdict ? [`${exports.LAST_RESULT_PREFIX}${inheritedVerdict}`, ""] : []),
+        `Mode: ${command === "summary" ? "summary" : "code review"}`,
+        `Model: ${model}`,
+    ].join("\n");
+}
+/**
+ * The newest marked status comment on the issue, or undefined when there is none.
+ *
+ * Best-effort: any API failure returns undefined so the caller falls back to creating a
+ * comment instead of failing the run.
+ */
+async function findLatestStatusComment(octokit, owner, repo, issueNumber) {
+    const client = octokit;
+    const paginate = client?.paginate;
+    const listComments = client?.rest?.issues?.listComments;
+    if (typeof paginate !== "function" || !listComments)
+        return undefined;
+    try {
+        const comments = await paginate.call(octokit, listComments, {
+            owner,
+            repo,
+            issue_number: issueNumber,
+            per_page: 100,
+        });
+        if (!Array.isArray(comments))
+            return undefined;
+        for (let i = comments.length - 1; i >= 0; i--) {
+            const comment = comments[i];
+            const id = Number(comment?.id);
+            const body = comment?.body;
+            if (!Number.isFinite(id))
+                continue;
+            if (typeof body !== "string" || !body.includes(exports.STATUS_COMMENT_MARKER))
+                continue;
+            return { id, body };
+        }
+        return undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+//# sourceMappingURL=status-comment.js.map
 
 /***/ }),
 
