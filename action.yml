@@ -49,7 +49,7 @@ inputs:
     required: false
     default: ""
   llm-relaunch-on-egress-failure:
-    description: "When a transient LLM egress failure blocks the review, abandon this CI run and start a fresh one (a new runner means a new egress path) by posting a /robin comment, carrying the previous round's comments over. Default is true. Set to false to fail immediately instead — useful when CI minutes are precious or the outage is expected to outlast a restart."
+    description: "When a transient LLM egress failure blocks the review, abandon this CI run and start a fresh one (a new runner means a new egress path) by posting a /robin comment, carrying the previous round's comments over. Requires a github-token that can start workflows: a PAT (ghp_ / github_pat_) or GitHub App token works, but the default GITHUB_TOKEN does NOT — events created with it never trigger a new workflow run (GitHub's anti-recursion rule; only workflow_dispatch and repository_dispatch are exempt), so with GITHUB_TOKEN Robin logs a warning and fails instead of pretending a restart happened. Default is true. Set to false to fail immediately instead — useful when CI minutes are precious or the outage is expected to outlast a restart."
     required: false
     default: "true"
   llm-max-relaunches:
