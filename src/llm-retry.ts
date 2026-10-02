@@ -162,6 +162,35 @@ function structuredReasoningParam(error: unknown): boolean {
   return typeof param === "string" && /\b(?:reasoning|effort|exclude)/i.test(param);
 }
 
+const MAX_ERROR_CAUSE_DEPTH = 5;
+
+/**
+ * 把错误自身与整条 `cause` 链拼成一段小写文本。
+ *
+ * 为什么需要：Node/undici 把绝大多数出口层故障（DNS 解析失败、连接被拒、
+ * TLS 握手失败、socket 断连）统一报成 `TypeError: fetch failed`，真实原因
+ * 只挂在 `error.cause` 上。只看 `error.message` 的话，"fetch failed"
+ * 一个关键词都匹配不上 ⇒ 被判成不可重试 ⇒ 一次都不重试。
+ *
+ * 深度有界（5 层）且按对象身份防环，避免 cause 自引用时死循环。
+ */
+export function errorTextChain(error: unknown): string {
+  const parts: string[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; depth < MAX_ERROR_CAUSE_DEPTH && current != null; depth++) {
+    if (typeof current === "object" || typeof current === "function") {
+      if (seen.has(current)) break;
+      seen.add(current);
+    }
+    parts.push(
+      current instanceof Error ? current.message : String(current)
+    );
+    current = (current as { cause?: unknown }).cause;
+  }
+  return parts.join(" | ").toLowerCase();
+}
+
 export function isRetriableLlmError(error: unknown, context: LlmRetryContext = {}): boolean {
   if (!error) return false;
 
@@ -180,7 +209,7 @@ export function isRetriableLlmError(error: unknown, context: LlmRetryContext = {
     }
   }
 
-  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  const message = errorTextChain(error);
   if (routerModel && (message.includes("404") || isOpenRouterProviderError(error))) {
     return true;
   }
@@ -195,7 +224,17 @@ export function isRetriableLlmError(error: unknown, context: LlmRetryContext = {
     message.includes("rate limit") ||
     message.includes("overloaded") ||
     message.includes("empty response from llm") ||
-    message.includes("openrouter stall")
+    message.includes("openrouter stall") ||
+    // 以下是实测漏判、但确属出口层瞬时故障的形态（探针见 R899）：
+    message.includes("fetch failed") ||
+    message.includes("etimedout") ||
+    message.includes("eai_again") ||
+    message.includes("enotfound") ||
+    message.includes("econnaborted") ||
+    message.includes("ehostunreach") ||
+    message.includes("enetunreach") ||
+    message.includes("epipe") ||
+    message.includes("und_err")
   );
 }
 
@@ -206,14 +245,26 @@ export function shouldUseJsonResponseMode(
   return jsonResponseMode && attempt === 1;
 }
 
+/**
+ * 退避抖动幅度（±25%）。原先退避是纯线性的：同一批并发作业在网关抖动时
+ * 会算出完全相同的等待值、同一时刻一起重试，形成惊群，反而把刚恢复的
+ * 出口再打垮。抖动让重试在时间上散开。
+ *
+ * `random` 可注入，测试里传 `() => 0.5` 即得到无抖动的精确值。
+ */
+export const RETRY_JITTER_RATIO = 0.25;
+
 export function computeRetryDelayMs(
   attempt: number,
   context: LlmRetryContext = {},
   baseDelayMs = isOpenRouterRouterModel(context.model)
     ? DEFAULT_LLM_ROUTER_RETRY_DELAY_MS
-    : DEFAULT_LLM_RETRY_DELAY_MS
+    : DEFAULT_LLM_RETRY_DELAY_MS,
+  random: () => number = Math.random
 ): number {
-  return baseDelayMs * attempt;
+  const linear = baseDelayMs * attempt;
+  const spread = linear * RETRY_JITTER_RATIO;
+  return Math.max(0, Math.round(linear + (random() * 2 - 1) * spread));
 }
 
 export function getLlmCompletionAttemptCount(

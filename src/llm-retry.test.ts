@@ -1,4 +1,5 @@
 import {
+  RETRY_JITTER_RATIO,
   computeRetryDelayMs,
   getLlmCompletionAttemptCount,
   isInvalidReasoningEffortError,
@@ -448,15 +449,36 @@ describe("shouldUseJsonResponseMode", () => {
 });
 
 describe("computeRetryDelayMs", () => {
+  // 注入 random=0.5 ⇒ 抖动项恰为 0，退避回到精确的线性值。
+  const noJitter = () => 0.5;
+
   it("backs off linearly by attempt", () => {
-    expect(computeRetryDelayMs(1, {}, 1000)).toBe(1000);
-    expect(computeRetryDelayMs(2, {}, 1000)).toBe(2000);
+    expect(computeRetryDelayMs(1, {}, 1000, noJitter)).toBe(1000);
+    expect(computeRetryDelayMs(2, {}, 1000, noJitter)).toBe(2000);
   });
 
   it("uses longer base delay for router models", () => {
-    expect(computeRetryDelayMs(1, { model: "openrouter/free" })).toBe(
-      DEFAULT_LLM_ROUTER_RETRY_DELAY_MS
-    );
+    expect(
+      computeRetryDelayMs(1, { model: "openrouter/free" }, undefined, noJitter)
+    ).toBe(DEFAULT_LLM_ROUTER_RETRY_DELAY_MS);
+  });
+
+  it("spreads retries in time so concurrent runs don't stampede (R900)", () => {
+    // 同一 attempt 下 random 取两端 ⇒ 等待值分别落在 ±25% 的下界与上界。
+    expect(computeRetryDelayMs(3, {}, 1000, () => 0)).toBe(2250);
+    expect(computeRetryDelayMs(3, {}, 1000, () => 1)).toBe(3750);
+    // random=0.5 时抖动项为 0，仍是线性值本身。
+    expect(computeRetryDelayMs(3, {}, 1000, noJitter)).toBe(3000);
+    // 抖动幅度受 RETRY_JITTER_RATIO 约束，不会把等待压到 0 或翻倍。
+    for (const r of [0.1, 0.25, 0.5, 0.75, 0.9]) {
+      const d = computeRetryDelayMs(4, {}, 1000, () => r);
+      expect(d).toBeGreaterThanOrEqual(4000 * (1 - RETRY_JITTER_RATIO));
+      expect(d).toBeLessThanOrEqual(4000 * (1 + RETRY_JITTER_RATIO));
+    }
+  });
+
+  it("never returns a negative delay", () => {
+    expect(computeRetryDelayMs(0, {}, 1000, () => 0)).toBe(0);
   });
 });
 
@@ -473,5 +495,61 @@ describe("getLlmCompletionAttemptCount", () => {
     expect(getLlmCompletionAttemptCount(DEFAULT_LLM_COMPLETION_ATTEMPTS, "gpt-4o")).toBe(
       DEFAULT_LLM_COMPLETION_ATTEMPTS
     );
+  });
+});
+
+describe("isRetriableLlmError 的出口故障覆盖（R900）", () => {
+  // 这批形态此前全部被判成"不可重试"，于是 CI 出口抖动时一次都不重试。
+  const egress: Array<[string, unknown]> = [
+    ["undici 通用出口失败", new TypeError("fetch failed")],
+    ["DNS 解析失败（cause 挂在 cause 上）", Object.assign(new TypeError("fetch failed"), { cause: new Error("getaddrinfo ENOTFOUND api.openai.com") })],
+    ["DNS 临时失败", new Error("getaddrinfo EAI_AGAIN api.openai.com")],
+    ["连接超时", new Error("connect ETIMEDOUT 1.2.3.4:443")],
+    ["socket 被中断", Object.assign(new TypeError("fetch failed"), { cause: new Error("UND_ERR_SOCKET") })],
+    ["连接被中止", new Error("read ECONNABORTED")],
+    ["主机不可达", new Error("connect EHOSTUNREACH 1.2.3.4:443")],
+    ["网络不可达", new Error("connect ENETUNREACH 1.2.3.4:443")],
+    ["管道断开", new Error("write EPIPE")],
+    ["原有的连接重置", new Error("read ECONNRESET")],
+    ["原有的 socket hang up", new Error("socket hang up")],
+    ["限流", Object.assign(new Error("Too Many Requests"), { status: 429 })],
+    ["服务端错误", Object.assign(new Error("boom"), { status: 500 })],
+  ];
+
+  for (const [name, err] of egress) {
+    it(`重试：${name}`, () => {
+      expect(isRetriableLlmError(err)).toBe(true);
+    });
+  }
+
+  it("仍然不重试：4xx（配置/鉴权错，重试无意义）", () => {
+    expect(isRetriableLlmError(Object.assign(new Error("bad request"), { status: 400 }))).toBe(false);
+    expect(isRetriableLlmError(Object.assign(new Error("unauthorized"), { status: 401 }))).toBe(false);
+    expect(isRetriableLlmError(Object.assign(new Error("forbidden"), { status: 403 }))).toBe(false);
+  });
+
+  it("cause 自引用时不死循环", () => {
+    const loop: Error & { cause?: unknown } = new Error("boom");
+    loop.cause = loop;
+    expect(isRetriableLlmError(loop)).toBe(false);
+  });
+
+  it("cause 链超过深度上界也能终止", () => {
+    let err: Error & { cause?: unknown } = new Error("socket hang up");
+    for (let i = 0; i < 50; i++) {
+      const next: Error & { cause?: unknown } = new Error("layer");
+      next.cause = err;
+      err = next;
+    }
+    // 最外层 5 层内都是 "layer"，够不到 socket hang up ⇒ 不可重试，但必须能返回。
+    expect(isRetriableLlmError(err)).toBe(false);
+    // 把有用的那层挪进深度窗口内就应当可重试。
+    let shallow: Error & { cause?: unknown } = new Error("socket hang up");
+    for (let i = 0; i < 3; i++) {
+      const next: Error & { cause?: unknown } = new Error("layer");
+      next.cause = shallow;
+      shallow = next;
+    }
+    expect(isRetriableLlmError(shallow)).toBe(true);
   });
 });
