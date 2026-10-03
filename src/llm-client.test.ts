@@ -633,4 +633,72 @@ describe("LLMClient exhausted-retry error keeps the provider cause (R925)", () =
       isTransientEgressFailure(await captureCompletionError(client), { model: "model" }),
     ).toBe(false);
   }, 20000);
+
+  /**
+   * R1084：分类是对的，**解释是错的**。
+   *
+   * 走到耗尽分支时，「最后一次 attempt 返回了空正文」是可证的（末次抛错早在
+   * `:146` 就抛出去了；返回非空正文在 `:135` 就 return 了）。所以 `lastError`
+   * 必然来自**更早的某次**，而原文案直接把它当最终结局报出去 ——
+   * 用户在 PR 上看到的是「Failed to get response from LLM after 2 attempts:
+   * upstream exploded」，而真实情况是最后一次拿到了 HTTP 响应、正文为空，
+   * 「空响应」这个真实死因**一个字都没留下**。
+   *
+   * 这与本仓库既有原则「失败评论必须说清真正原因」冲突。
+   *
+   * **注意不要顺手把 cause 一起清掉** —— 上面两条测试（R925）就是为此存在的：
+   * 空正文没有 status 可给，cause 是上层唯一的分诊输入。
+   */
+  it("说清真正死因是空正文，同时不丢更早那次 provider 错误", async () => {
+    const client = exhaustedClient();
+    const create = stubOpenAI(client);
+    const providerError = Object.assign(new Error("upstream exploded"), { status: 503 });
+    create.mockRejectedValueOnce(providerError).mockResolvedValueOnce(completionResponse(""));
+
+    const wrapper = (await captureCompletionError(client)) as Error & { cause?: unknown };
+
+    // 真实死因必须在文案里
+    expect(wrapper.message).toContain("last attempt returned empty content");
+    // 更早那次也不能从文案里消失（否则丢掉唯一的 provider 线索）
+    expect(wrapper.message).toContain("upstream exploded");
+    // 原有契约不许破
+    expect(wrapper.message).toContain("after 2 attempts");
+    // 承重的那部分：cause 必须仍是 provider 错误
+    expect(wrapper.cause).toBe(providerError);
+  }, 20000);
+
+  /**
+   * 新增的文案不得**引入**任何可重试特征词，否则会把永久故障洗成瞬时
+   * （无限重启 CI）。这是对上一条的补充：它只断言"说了什么"，
+   * 这条断言"因此没改变判定"。
+   */
+  it("如实的文案不改变分诊结论（status-only 503 仍然算出口瞬时故障）", async () => {
+    const client = exhaustedClient();
+    const create = stubOpenAI(client);
+    create
+      .mockRejectedValueOnce(Object.assign(new Error("totally opaque text"), { status: 503 }))
+      .mockResolvedValueOnce(completionResponse(""));
+
+    expect(isTransientEgressFailure(await captureCompletionError(client), { model: "model" })).toBe(
+      true,
+    );
+  }, 20000);
+
+  /**
+   * 反向：文案里新增的「空正文」措辞**不能**把永久故障判成可重试。
+   * 与上一条成对 —— 两条一起把「文案措辞」与「分诊判定」解耦钉住。
+   */
+  it("如实的文案不改变分诊结论（ENOTFOUND 仍然不算瞬时）", async () => {
+    const client = exhaustedClient();
+    const create = stubOpenAI(client);
+    create
+      .mockRejectedValueOnce(
+        Object.assign(new Error("getaddrinfo ENOTFOUND api.invalid.test"), { code: "ENOTFOUND" }),
+      )
+      .mockResolvedValueOnce(completionResponse(""));
+
+    expect(
+      isTransientEgressFailure(await captureCompletionError(client), { model: "model" }),
+    ).toBe(false);
+  }, 20000);
 });

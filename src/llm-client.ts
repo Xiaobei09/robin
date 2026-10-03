@@ -162,15 +162,30 @@ export class LLMClient {
       }
     }
 
-    // 只看 lastError 是否存在，不再重算 isRetriableLlmError：
-    // 能走到这里说明所有 attempt 都没在 catch 里抛出（:143 已经把不可重试的
-    // 错误抛出去了），所以 lastError 必然是可重试的那个。重算谓词既冗余，
-    // 又会在谓词日后变得依赖运行时状态时把真实的 API 错误误报成
-    // 「空响应」——那会让上层连"要不要换 CI"都判错。
+    // 走到这里时，**最后一次 attempt 必然是"返回了空正文"**，可证：
+    //   末次 attempt 一旦抛错，:146 的 `attempt === this.maxAttempts` 会先抛出去，
+    //   根本到不了这个分支；而返回非空正文则在 :135 直接 return。
+    // 所以 `lastError`（如果非空）来自**更早的某次** attempt ——
+    // 它描述的不是最终结局。
+    //
+    // 但**不能**因此把 lastError 丢掉或清空：上层 `isTransientEgressFailure` 靠
+    // `llmErrorStatus` 沿 cause 链读 provider 的 `status`/`code`，而「空正文」这个
+    // 结局**根本没有 status 可给**。R925 的两条测试就是为了钉这件事：
+    // 丢掉 cause ⇒ 一次 status-only 的 503 瞬断被判成不可重试（不重启），
+    // 或者一次 ENOTFOUND 永久故障被洗成瞬时（无限重启 CI）。
+    // 因此 `cause` 原样保留 lastError，只把**正文**改成如实描述两件事。
+    //
+    // 也不重算 isRetriableLlmError：能走到这里说明 lastError 必然是可重试的那个
+    // （不可重试的早在 catch 里抛了）。重算既冗余，又会在谓词日后变得依赖运行时
+    // 状态时把真实的 provider 错误误报成「空响应」。
     if (lastError) {
-      core.error(`LLM API error after ${this.maxAttempts} attempts: ${lastError}`);
+      core.error(
+        `LLM API error after ${this.maxAttempts} attempts: last attempt returned empty ` +
+          `content; an earlier attempt failed with: ${lastError}`
+      );
       throw new Error(
-        `Failed to get response from LLM after ${this.maxAttempts} attempts: ${lastError}`,
+        `Failed to get response from LLM after ${this.maxAttempts} attempts: ` +
+          `last attempt returned empty content; an earlier attempt failed with: ${lastError}`,
         { cause: lastError }
       );
     }
