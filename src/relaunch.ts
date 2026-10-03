@@ -175,8 +175,21 @@ function parseRelaunchMeta(body: string): RelaunchMeta {
     const value = trimmed.slice(eq + 1).trim();
     if (key === "hop") {
       // 正文写的是 `hop=1 of 2`，取第一个 token 才是跳数。
-      const parsed = Number(value.split(/\s+/)[0]);
-      if (Number.isFinite(parsed)) meta.hop = parsed;
+      //
+      // 为什么不能用裸 `Number()`（R1075）：`Number("")` 是 0 且 `isFinite(0)`
+      // 为真，于是**空值被读成一条合法的「已用 0 次」声明** —— 解析器凭空造出一个
+      // 数值，而不是拒绝这份声明。`hop=abc` 反而是对的（NaN → 跳过），所以这个洞
+      // 只在「键在、值空」时出现，最容易漏看。
+      //
+      // 今天它没造成后果，**只是因为聚合是取 max**：造出来的 0 抬不高已有的 hop。
+      // 但同一段代码里「后出现的 hop 覆盖先出现的」（下面直接赋值）意味着这条
+      // 造值逻辑一旦被单独读到，就是一个会编造事实的解析器。判定「什么算合法数字
+      // 写法」只应有一处 ⇒ 复用 `parseStrictNumber`（R1071/R1073 立的规矩）。
+      const token = value.split(/\s+/)[0] ?? "";
+      if (token) {
+        const { value: parsed, valid } = parseStrictNumber(token);
+        if (valid) meta.hop = parsed;
+      }
     } else if (key === "sha" && /^[0-9a-fA-F]{7,40}$/.test(value)) {
       meta.headSha = value;
     }

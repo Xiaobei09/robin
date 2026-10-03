@@ -698,3 +698,88 @@ describe("R1073：重启次数护栏有界，且不吃非十进制写法", () =>
     expect(body).not.toMatch(/\bNumber\(\s*String\(\s*raw/);
   });
 });
+
+/**
+ * R1075：hop 是**成本护栏**，它的输入（PR 评论）人人可写。
+ *
+ * 既有测试防的是另一种威胁：网关自由文本里伪造 `sha=` 行（见上方两条判别性用例），
+ * 并且代码注释给了一个明确判断：「hop 是成本护栏，被伪造的方向只能是『多重启』」。
+ * 这个判断**成立** —— 因为聚合是取 max，任何人写进来的 hop 只能把计数**推高**。
+ *
+ * 但这个方向性完全由 `if (meta.hop > hop)` 这**一个运算符**担保，而它一个测试都没有。
+ * 一旦有人把 max 改成「后出现者覆盖」（那段「一轮接一轮叠出多条 hop=，取最新的那个
+ * 对」的注释很容易诱导这种改法），守护配额的最后一道防线就静默消失，且没有任何
+ * 红灯。所以这里把「单调」钉成不变式，而不是逐个记结论。
+ *
+ * 同时修掉一个真实缺陷：`parseRelaunchMeta` 曾用裸 `Number()`，而 `Number("") === 0`
+ * 且 `isFinite(0)` 为真 ⇒ 空值被读成一条合法的「已用 0 次」声明。解析器凭空造值，
+ * 与 R1071/R1073 同一族（`Number()` 照猜的读）。
+ */
+describe("R1075：护栏的输入人人可写 —— 方向性必须被钉住", () => {
+  const SHA_A = "a".repeat(40);
+  const bot = (hop: number) =>
+    buildRelaunchCommentBody({
+      hop,
+      maxRelaunches: 2,
+      errorText: "x",
+      headSha: SHA_A,
+    });
+
+  it("单调：多读一条评论，hop 只可能不变或变大，绝不可能变小", () => {
+    // 这是「白烧 CI 分钟」的唯一防线。逐个断言具体数字是不够的 ——
+    // 必须断言性质本身，否则改动聚合方式时会静默通过。
+    const base = [bot(1)];
+    expect(readPreviousHop(base, { headSha: SHA_A })).toBe(1);
+    for (const adversarial of [
+      `${RELAUNCH_MARKER}\nhop=0\nsha=${SHA_A}`, // 试图「重置」额度
+      `${RELAUNCH_MARKER}\nhop=\nsha=${SHA_A}`, // 空值
+      `${RELAUNCH_MARKER}\nhop=-100\nsha=${SHA_A}`, // 负数
+      `普通评论，恰好提到 hop=0`,
+      `${RELAUNCH_MARKER}\nhop=0.4\nsha=${SHA_A}`,
+    ]) {
+      const grown = [...base, adversarial];
+      expect(readPreviousHop(grown, { headSha: SHA_A })).toBeGreaterThanOrEqual(
+        readPreviousHop(base, { headSha: SHA_A })
+      );
+    }
+  });
+
+  it("人写的评论只能把计数推高（永久禁用重启），不能压低 —— 已文档化的取舍", () => {
+    // 推高 = fail closed：不会白烧配额，代价是重启功能对该 commit 失效。
+    // 这与 status 评论路径不同：那里人类复制标记会被**整条覆盖**（不可恢复），
+    // 这里最坏只是多读一个数，所以**刻意不加作者过滤**。
+    //
+    // 为什么不加：`robin.yml` 用 GH_PAT 代发评论，此时评论作者是 PAT 所属用户
+    // 而非 github-actions[bot]。按 bot login 过滤会让 PAT 消费方**永远读到 hop=0**
+    // ⇒ 每次故障都重启 ⇒ 正好把上面那个 fail closed 的缺口翻转成无限重启。
+    // 拿 hop 的身份判据（bot login）在 PAT 下不成立，这是加过滤会踩的坑。
+    expect(readPreviousHop([bot(2), `${RELAUNCH_MARKER}\nhop=0\nsha=${SHA_A}`], { headSha: SHA_A })).toBe(2);
+    expect(readPreviousHop([bot(1), `${RELAUNCH_MARKER}\nhop=999\nsha=${SHA_A}`], { headSha: SHA_A })).toBe(999);
+  });
+
+  it("机器块里的空值不造值（判别性用例：后出现的 hop 不得抹掉真实计数）", () => {
+    // `hop=2` 后跟一个空的 `hop=`：旧实现读成 0（真实计数被凭空抹掉），
+    // 新实现保持 2。同一段代码里是直接赋值 ⇒ 后者覆盖前者，所以这条能区分。
+    const body = `${RELAUNCH_MARKER}\nhop=2 of 2\nhop=\nsha=${SHA_A}`;
+    expect(readPreviousHop([body], { headSha: SHA_A })).toBe(2);
+    const ws = `${RELAUNCH_MARKER}\nhop=2 of 2\nhop=   \nsha=${SHA_A}`;
+    expect(readPreviousHop([ws], { headSha: SHA_A })).toBe(2);
+  });
+
+  it("hop 只接受纯十进制写法，与全仓其它数字解析保持一致", () => {
+    for (const v of ["1e1", "0x2", "0b11", "abc", "", "  "]) {
+      expect(readPreviousHop([`${RELAUNCH_MARKER}\nhop=${v}`])).toBe(0);
+    }
+    expect(readPreviousHop([`${RELAUNCH_MARKER}\nhop=3 of 2`])).toBe(3);
+  });
+
+  it("机器块解析不再使用裸 Number()", () => {
+    const src = readFileSync(join(__dirname, "relaunch.ts"), "utf8");
+    const start = src.indexOf("function parseRelaunchMeta(");
+    expect(start).toBeGreaterThan(-1);
+    const body = src.slice(start, src.indexOf("\n}\n", start));
+    // `\\b` 必需：parseStrictNumber( 里的 "Number(" 前面紧邻词字符，没有词边界。
+    expect(body).toContain("parseStrictNumber");
+    expect(body).not.toMatch(/\bNumber\(\s*value/);
+  });
+});
