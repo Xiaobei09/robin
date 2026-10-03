@@ -702,3 +702,37 @@ describe("LLMClient exhausted-retry error keeps the provider cause (R925)", () =
     ).toBe(false);
   }, 20000);
 });
+
+describe("LLMClient streaming stall timer（R1094：零 chunk 也要清掉 45s 定时器）", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it("流零 chunk 正常结束时不再泄漏 first-chunk 定时器", async () => {
+    jest.useFakeTimers();
+    // 路由模型才走流式路径；maxAttempts=1 隔离成单次尝试，
+    // 避免重试的 delayMs 也注册 setTimeout、污染 getTimerCount()。
+    const client = new LLMClient(
+      "https://example.test/v1",
+      "test-key",
+      "openrouter/free",
+      undefined,
+      undefined,
+      1,
+    );
+    const create = stubOpenAI(client);
+    // 网关返回 200，但流里一个 chunk 都没有、直接正常结束。
+    create.mockResolvedValueOnce(streamOf([]));
+
+    await expect(client.chatCompletion("system", "user")).rejects.toThrow(/Empty response/);
+
+    // 修复前：循环体一次都不进 ⇒ 首 chunk 清理与 catch 清理都不执行
+    // ⇒ 这个 45000ms 的 setTimeout 留在事件循环里。修复后应为 0 个待触发定时器。
+    expect(jest.getTimerCount()).toBe(0);
+  });
+});
+

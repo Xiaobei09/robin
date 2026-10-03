@@ -311,7 +311,6 @@ export class LLMClient {
 
       return { content: parts.join(""), model: resolvedModel };
     } catch (error) {
-      clearStallTimer();
       if (!gotFirstChunk) {
         // A 400/422 mentioning a reasoning request key is a definitive client response,
         // not a stalled router. Surface it even when the stricter fallback classifiers
@@ -332,6 +331,13 @@ export class LLMClient {
         throw openRouterStallError(firstChunkMs);
       }
       throw error;
+    } finally {
+      // R1094：必须放 `finally`，不能用「首个 chunk 时清理 + catch 里清理」。
+      // 若流**零 chunk 正常结束**（网关返回 200 但只给 `[DONE]`，或空 SSE），
+      // 循环体一次都不进 ⇒ 两处清理都不执行 ⇒ 45s 的 setTimeout 泄漏，
+      // 把 Node 事件循环多拖住最长 firstChunkMs 才退出；每次空尝试还会叠加一个。
+      // `finally` 覆盖成功返回、抛错、零 chunk 三条路径。
+      clearStallTimer();
     }
   }
 
