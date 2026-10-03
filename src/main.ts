@@ -23,6 +23,7 @@ import {
   parseLLMMaxAttempts,
   parseLLMTemperature,
   parseLLMTimeout,
+  parseStrictNumber,
 } from "./config";
 import { filterDiff, splitDiffIntoFiles } from "./diff-filter";
 import { annotateDiffWithLineNumbers } from "./diff-annotate";
@@ -173,7 +174,18 @@ async function run(): Promise<void> {
     const maxDiffSizeInput = core.getInput("max-diff-size") || String(DEFAULT_ACTION_MAX_DIFF_SIZE);
     const maxCommentsInput = core.getInput("max-comments") || String(DEFAULT_MAX_COMMENTS);
     const maxOutputTokensInput = core.getInput("max-output-tokens") || "";
-    const maxOutputTokens = maxOutputTokensInput ? parseInt(maxOutputTokensInput, 10) : undefined;
+    // 同一个 parseInt 陷阱的第三例：parseInt("1e3") = 1，而 llm-client 只查
+    // `> 0`，于是 1 会通过 ⇒ 模型被限到 1 个 token，审查输出几乎必然为空。
+    const maxOutputTokensParsed = parseStrictNumber(maxOutputTokensInput);
+    const maxOutputTokensValid =
+      maxOutputTokensParsed.valid && Number.isInteger(maxOutputTokensParsed.value);
+    if (maxOutputTokensInput && !maxOutputTokensValid) {
+      core.warning(
+        `Invalid max-output-tokens value "${maxOutputTokensInput}", ignoring it`,
+      );
+    }
+    const maxOutputTokens =
+      maxOutputTokensInput && maxOutputTokensValid ? maxOutputTokensParsed.value : undefined;
     const reasoningEffortInput = core.getInput("reasoning-effort") || "";
     const llmTimeoutMsInput = core.getInput("llm-timeout-ms") || "";
     const { value: llmTimeoutMs, valid: llmTimeoutValid } = parseLLMTimeout(llmTimeoutMsInput);
@@ -264,8 +276,24 @@ async function run(): Promise<void> {
       configFile,
       baseRef
     );
-    const maxDiffSize = resolveMaxDiffSize(maxDiffSizeInput, repoConfig);
-    const maxComments = resolveMaxComments(maxCommentsInput, repoConfig);
+    const { value: maxDiffSize, valid: maxDiffSizeValid } = resolveMaxDiffSize(
+      maxDiffSizeInput,
+      repoConfig,
+    );
+    if (!maxDiffSizeValid) {
+      core.warning(
+        `Invalid max-diff-size value "${maxDiffSizeInput}", using default ${DEFAULT_ACTION_MAX_DIFF_SIZE}`,
+      );
+    }
+    const { value: maxComments, valid: maxCommentsValid } = resolveMaxComments(
+      maxCommentsInput,
+      repoConfig,
+    );
+    if (!maxCommentsValid) {
+      core.warning(
+        `Invalid max-comments value "${maxCommentsInput}", using default ${DEFAULT_MAX_COMMENTS}`,
+      );
+    }
     const jsonResponseMode = resolveJsonResponseMode(jsonResponseModeInput, repoConfig);
     const requestChanges = resolveRequestChanges(requestChangesInput, repoConfig);
     const reasoningEffort = resolveReasoningEffort(reasoningEffortInput, repoConfig);

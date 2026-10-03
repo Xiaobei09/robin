@@ -1,3 +1,5 @@
+import { parseStrictNumber } from "./config";
+
 export const DEFAULT_CONFIG_FILE = ".github/robin.yml";
 export const DEFAULT_ACTION_MAX_DIFF_SIZE = 50000;
 /** Single default shared by action.yml and the reusable review.yml workflow. */
@@ -105,26 +107,58 @@ export function parseRepoConfigYaml(text: string): RepoConfig {
   return config;
 }
 
-export function resolveMaxDiffSize(actionInput: string, repoConfig?: RepoConfig): number {
-  const parsed = parseInt(actionInput, 10);
-  if (
-    repoConfig?.maxDiffSize !== undefined &&
-    Number.isFinite(parsed) &&
-    parsed === DEFAULT_ACTION_MAX_DIFF_SIZE &&
-    repoConfig.maxDiffSize !== DEFAULT_ACTION_MAX_DIFF_SIZE
-  ) {
-    return repoConfig.maxDiffSize;
+/**
+ * 解析 `max-comments`。
+ *
+ * 「未设置」的判定是**哨兵**：输入要么没表达出有效意图（空串 / 乱码），要么恰好
+ * 等于默认常量（`action.yml` 与 `review.yml` 会把 default 原样透传下来）。只有这
+ * 两种情况下 `.github/robin.yml` 才能赢 —— 见 `main.ts` 里那两行兜底的注释。
+ *
+ * `valid=false` 表示输入不可用、已回落到默认值；调用方**应当**就此告警，
+ * 否则用户会拿到一个自己没要求过的值而毫无察觉。
+ */
+export function resolveMaxComments(
+  actionInput: string,
+  repoConfig?: RepoConfig,
+): { value: number; valid: boolean } {
+  const { value: raw, valid: parsedOk } = parseStrictNumber(actionInput);
+  // 计数没有小数的意义，Math.floor 会把 "1.9" 这类拼写错误藏起来。
+  const valid = parsedOk && Number.isInteger(raw);
+  const parsed = valid ? raw : Number.NaN;
+  const isUnset = !valid || parsed === DEFAULT_MAX_COMMENTS;
+  if (repoConfig?.maxComments !== undefined && isUnset) {
+    return { value: repoConfig.maxComments, valid };
   }
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_ACTION_MAX_DIFF_SIZE;
+  // 0 是合法值（关掉内联评论），所以用区间而不是真值判断。
+  if (!valid) return { value: DEFAULT_MAX_COMMENTS, valid: false };
+  return { value: parsed >= 0 ? parsed : DEFAULT_MAX_COMMENTS, valid: parsed >= 0 };
 }
 
-export function resolveMaxComments(actionInput: string, repoConfig?: RepoConfig): number {
-  const parsed = parseInt(actionInput, 10);
-  const isUnset = Number.isFinite(parsed) && parsed === DEFAULT_MAX_COMMENTS;
-  if (repoConfig?.maxComments !== undefined && isUnset) {
-    return repoConfig.maxComments;
+/**
+ * 解析 `max-diff-size`。
+ *
+ * 哨兵语义与 `resolveMaxComments` 相同，外加一条：即使输入等于默认常量，
+ * repo config 自己也等于默认常量时不算「repo 显式配置过」，不必返回。
+ */
+export function resolveMaxDiffSize(
+  actionInput: string,
+  repoConfig?: RepoConfig,
+): { value: number; valid: boolean } {
+  const { value: raw, valid: parsedOk } = parseStrictNumber(actionInput);
+  const valid = parsedOk && Number.isInteger(raw);
+  const parsed = valid ? raw : Number.NaN;
+  const isUnset =
+    !valid ||
+    (parsed === DEFAULT_ACTION_MAX_DIFF_SIZE &&
+      repoConfig?.maxDiffSize !== DEFAULT_ACTION_MAX_DIFF_SIZE);
+  if (repoConfig?.maxDiffSize !== undefined && isUnset) {
+    return { value: repoConfig.maxDiffSize, valid };
   }
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_MAX_COMMENTS;
+  if (!valid) return { value: DEFAULT_ACTION_MAX_DIFF_SIZE, valid: false };
+  return {
+    value: parsed > 0 ? parsed : DEFAULT_ACTION_MAX_DIFF_SIZE,
+    valid: parsed > 0,
+  };
 }
 
 export function resolveJsonResponseMode(actionInput: string, repoConfig?: RepoConfig): boolean {

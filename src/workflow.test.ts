@@ -401,8 +401,8 @@ describe("「未设置」哨兵：五份副本必须逐字相等（R946）", () 
   it("哨兵真的能让 repo 配置赢：空输入 + repo 有值 ⇒ 取 repo 的值", () => {
     // 这是哨兵存在的**理由**。若哪天改成别的判定方式，下面两条会红，
     // 而那时「action default 等于常量」这条相等性本身未必察觉得到。
-    expect(resolveMaxComments(String(DEFAULT_MAX_COMMENTS), { maxComments: 8 })).toBe(8);
-    expect(resolveMaxDiffSize(String(DEFAULT_ACTION_MAX_DIFF_SIZE), { maxDiffSize: 9 })).toBe(9);
+    expect(resolveMaxComments(String(DEFAULT_MAX_COMMENTS), { maxComments: 8 }).value).toBe(8);
+    expect(resolveMaxDiffSize(String(DEFAULT_ACTION_MAX_DIFF_SIZE), { maxDiffSize: 9 }).value).toBe(9);
   });
 
   it("docs/ADVANCED.md 写给人的默认值也等于常量（文档漂移同样是静默降级）", () => {

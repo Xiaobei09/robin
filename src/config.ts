@@ -9,10 +9,33 @@ export const DEFAULT_LLM_TEMPERATURE = 0.1; // near-deterministic reviews
 /** OpenAI-compatible upper bound; some models (e.g. Kimi) only accept 1. */
 export const MAX_LLM_TEMPERATURE = 2;
 
+/**
+ * 严格数字解析：只接受**纯十进制写法**（可选一位小数部分）。
+ *
+ * 为什么不直接用 `Number()`：`Number` 会「照猜的读」而不是拒绝拼写错误 ——
+ * `Number("0x10")=16`、`Number("0b11")=3`、`Number("1e3")=1000`。对 timeout 这种
+ * 参数，那意味着 `llm-timeout-ms: 1e3` 变成 1000 **毫秒**，每次审查必然超时失败，
+ * 而日志里看不出任何异常。`parseInt` 更糟：它把拼写错误**静默变成一个合法但完全
+ * 不同的数**（`parseInt("1e3")=1`、`parseInt("0x10")=0`）。
+ *
+ * 空串必须先拦：`Number("") === 0`。不拦的话「未设置」会被悄悄变成「显式 0」。
+ * 下溢同理：`Number("1e-400") === 0`。
+ *
+ * 小数**允许**（timeout 5000.5ms 虽无意义但无害，且已有测试钉住），
+ * 需要整数的调用方自己加 `Number.isInteger`。
+ */
+export function parseStrictNumber(input: string): { value: number; valid: boolean } {
+  const trimmed = input.trim();
+  if (!/^\d+(\.\d+)?$/.test(trimmed)) return { value: Number.NaN, valid: false };
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed)) return { value: Number.NaN, valid: false };
+  return { value: parsed, valid: true };
+}
+
 export function parseLLMTimeout(input: string): { value: number; valid: boolean } {
   if (!input) return { value: DEFAULT_LLM_TIMEOUT_MS, valid: true };
-  const parsed = Number(input);
-  if (Number.isFinite(parsed) && parsed > 0) {
+  const { value: parsed, valid } = parseStrictNumber(input);
+  if (valid && parsed > 0) {
     return { value: parsed, valid: true };
   }
   return { value: DEFAULT_LLM_TIMEOUT_MS, valid: false };
