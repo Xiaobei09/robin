@@ -178,7 +178,7 @@ export class ReviewParser {
     const description = this.asString(item.description).trim();
     if (!description) return null;
 
-    const line = this.asNumber(item.line);
+    const line = this.asLineNumber(item.line);
     const file = this.asString(item.file).trim() || undefined;
 
     return {
@@ -204,9 +204,27 @@ export class ReviewParser {
       : undefined;
   }
 
-  private static asNumber(value: unknown): number | undefined {
-    if (typeof value === "number" && Number.isFinite(value)) return value;
-    if (typeof value === "string" && /^\d+$/.test(value)) return parseInt(value, 10);
+  /**
+   * 行号必须是 **1 起的整数**：0 与负数在文件里不存在，小数也不是行号。
+   *
+   * 旧的 `asNumber` 只判 `Number.isFinite`，而 `/^\d+$/` 只管字符串分支 ——
+   * number 分支直接放行，于是 `line: 0` / `line: -5` / `line: 1.5` /
+   * `line: 99999999` 全被原样接受（实测四项都出现在解析结果里）。
+   *
+   * 下游目前**恰好**挡得住：`github-reviewer` 的 `!finding.line` 丢掉 0，
+   * `isLineInNewDiff` 丢掉其余。但那是两道「恰好挡下」的护栏，不是「本来就合法」，
+   * 有人改下游就会退化。与其指望下游兜底，不如在这里就不产出非法行号。
+   *
+   * 改名 `asLineNumber` 是因为它**只**服务 `line` 字段（confidence 走独立的
+   * `asConfidence`，需要 0..1 的小数）。名字应当说明契约，否则将来有人拿它去解析
+   * 置信度就会踩坑。
+   */
+  private static asLineNumber(value: unknown): number | undefined {
+    if (typeof value === "number" && Number.isInteger(value) && value >= 1) return value;
+    if (typeof value === "string" && /^\d+$/.test(value)) {
+      const parsed = parseInt(value, 10);
+      if (parsed >= 1) return parsed;
+    }
     return undefined;
   }
 
@@ -321,17 +339,78 @@ export class ReviewParser {
       };
     }
 
-    // Fallback: try to find file and line anywhere in the text
-    const filePattern = /[`']?([^`\s]+\.(?:[a-zA-Z0-9]+))[`']?/i;
-    const linePattern = /:(\d+)/i;
+    // Fallback: 行号必须**紧跟**文件名，而不是在整句里各找各的。
+    //
+    // 旧实现分别跑两个正则：filePattern 取整句里**第一个** `xxx.ext`，linePattern 取
+    // 整句里**第一个** `:数字`。散文里的东西于是全被当成定位信息（以下走真
+    // ReviewParser.parseDetailed 实测）：
+    //
+    //   "- At 09:05 the code in src/auth.ts:42 ran."       => file=src/auth.ts  line=5
+    //   "- It runs at 10:30 and e.g. retries twice in src/auth.ts:42."
+    //                                                          => file="e.g"      line=30
+    //   "- Version 1.5 introduced this, see src/auth.ts:42." => file="1.5"      line=42
+    //   "- Endpoint https://example.com:8080/v1 fails, see src/auth.ts:42."
+    //                                                          => file=https://… line=8080
+    //
+    // 第一条最毒：**文件名对了、行号错了**。`GitHubReviewer.isLineInNewDiff` 只检查
+    // 行号是否落在该文件的 diff 范围内，5 行若在 diff 里就会**放行** ⇒ 评论发到
+    // `src/auth.ts:5`，而模型写的是 `:42`。这是会误导审查者的错位评论。
+    //
+    // 其余几条后果稍轻：`files.find(f => f.filename === finding.file)` 找不到就
+    // warning 后整条丢弃，所以不会污染 GitHub review；但模型给出的真实发现就此
+    // **静默消失**，只在日志里留一条 warning。
+    //
+    // 改成「文件紧跟 `:行号`」的配对匹配之后：
+    // - `e.g.` / `1.5` 后面没有 `:数字`，天然不会被当成定位；
+    // - 行号不再可能来自散文别处的 `:数字`（时间 `09:05`、端口 `:8080`）。
+    //
+    // URL 仍然满足这个形态（`example.com:8080`），所以候选还要过 `looksLikeFilePath`。
+    const pairPattern = /[`']?([^\s`'():]+\.[a-zA-Z0-9]+)[`']?\s*:\s*(\d+)/g;
+    let pair: RegExpExecArray | null;
+    while ((pair = pairPattern.exec(itemText)) !== null) {
+      if (!this.looksLikeFilePath(pair[1])) continue;
+      return {
+        file: pair[1],
+        line: parseInt(pair[2], 10),
+        cleanedText: itemText,
+      };
+    }
 
-    const fileMatch = itemText.match(filePattern);
-    const lineMatch = itemText.match(linePattern);
+    // 没有行号时仍保留文件名：`GitHubReviewer` 会跳过内联评论（`!finding.line`），
+    // 但 location 文案里还会显示文件名，这个能力要留住。
+    const filePattern = /[`']?([^\s`'():]+\.[a-zA-Z0-9]+)[`']?/g;
+    let fileMatch: RegExpExecArray | null;
+    while ((fileMatch = filePattern.exec(itemText)) !== null) {
+      if (!this.looksLikeFilePath(fileMatch[1])) continue;
+      return { file: fileMatch[1], line: undefined, cleanedText: itemText };
+    }
 
-    return {
-      file: fileMatch ? fileMatch[1] : undefined,
-      line: lineMatch ? parseInt(lineMatch[1], 10) : undefined,
-      cleanedText: itemText,
-    };
+    // 「只有行号」这条路径是**故意删掉**的：没有文件定位的行号本来就发不出评论，
+    // 而它恰恰是散文里时间、端口、`"a":1` 这类片段的来源。
+    return { file: undefined, line: undefined, cleanedText: itemText };
+  }
+
+  /**
+   * 候选像不像仓库里的文件路径 —— 用来把散文里的 `e.g` / `1.5` / URL 挡在门外。
+   *
+   * 判据刻意保守，宁可漏（丢掉一条评论）也不误判（把评论发到错误的行上）：
+   * - 含 `//` ⇒ URL（`https://example.com`、`//example.com`）；
+   * - 含 `/` ⇒ 有目录前缀，直接认；
+   - 否则只看扩展名：`e.g` / `i.e` 的扩展名只有一个字母，而 `README.md` / `a.ts` /
+   *   `Makefile` 的都够长。
+   *
+   * 已知残余：`www.example.com:8080` 这种不带 `//` 的形式仍会通过（有目录前缀的
+   * 规则兜不住它，扩展名 `com` 也够长）。后果只是被下游 `files.find` 丢弃 ——
+   * 丢发现，不会错位 —— 比原先严格。
+   *
+   * 之所以抽成方法而不是内联，是因为**两个匹配路径（配对、仅文件名）都要用**；
+   * 内联复制的话，变异「只在一处加判据」不会被任何测试抓到。
+   */
+  private static looksLikeFilePath(candidate: string): boolean {
+    if (candidate.includes("//")) return false;
+    if (candidate.includes("/")) return true;
+    const dot = candidate.lastIndexOf(".");
+    if (dot === -1) return false;
+    return /^[a-zA-Z]{2,}$/.test(candidate.slice(dot + 1));
   }
 }

@@ -255,3 +255,134 @@ describe("extractJsonObject：合法 JSON 不被散文里的花括号污染", ()
     expect(parsed.findings.summary).toBe("ok");
   });
 });
+
+/**
+ * 定位信息（file/line）必须**指向 PR 里真实存在的位置**，否则内联评论要么被丢、
+ * 要么落到错误的行上。
+ *
+ * 旧的 fallback 分别跑两个正则：`filePattern` 取整句里**第一个** `xxx.ext`，
+ * `linePattern` 取整句里**第一个** `:数字`。散文里的东西于是全被当成定位信息
+ * （以下全部走真 ReviewParser.parseDetailed 实测）：
+ *
+ *   "- At 09:05 the code in src/auth.ts:42 ran."
+ *        => file="src/auth.ts"  line=5     ← 文件对了、行号错了
+ *   "- ... e.g. retries twice in src/auth.ts:42."
+ *        => file="e.g"          line=30
+ *   "- Version 1.5 introduced this, see src/auth.ts:42 above."
+ *        => file="1.5"          line=42
+ *   "- Endpoint https://example.com:8080/v1 fails, see src/auth.ts:42."
+ *        => file="https://example.com"  line=8080
+ *   "- This is a general design concern, e.g. about naming."
+ *        => file="e.g"          line=undefined
+ *
+ * 第一条最毒：文件名对了、行号错了。而 `GitHubReviewer.isLineInNewDiff` 只检查行号
+ * 是否落在该文件的 diff 范围内 —— 5 行若在 diff 里就会**放行**，于是评论被发到
+ * `src/auth.ts:5`，模型写的却是 `:42`。这是会误导审查者的错位评论。
+ *
+ * 其余几条的下游后果稍轻：`files.find(f => f.filename === finding.file)` 找不到
+ * 就会 warning 后整条丢弃，所以不会污染 GitHub review；但模型给出的真实发现就
+ * 此**静默消失**了，只在日志里留一条 warning。
+ */
+describe("定位信息：散文里的东西不能被当成 file/line", () => {
+  const high = (bullet: string) =>
+    `### Summary\nok\n\n### High Issues (must fix)\n${bullet}\n`;
+  const only = (bullet: string) => ReviewParser.parseDetailed(high(bullet)).findings.high[0];
+
+  it("时间在前、文件名在后时，行号取自文件名而不是时间", () => {
+    const f = only("- At 09:05 the code in src/auth.ts:42 ran.");
+    expect(f).toMatchObject({ file: "src/auth.ts", line: 42 });
+  });
+
+  it("散文里的 e.g. 不会被当成文件名，时间不会被当成行号", () => {
+    const f = only("- It runs at 10:30 and e.g. retries twice in src/auth.ts:42.");
+    expect(f).toMatchObject({ file: "src/auth.ts", line: 42 });
+  });
+
+  it("版本号 1.5 不会被当成文件名", () => {
+    const f = only("- Version 1.5 introduced this, see src/auth.ts:42 above.");
+    expect(f).toMatchObject({ file: "src/auth.ts", line: 42 });
+  });
+
+  it("URL 不会被当成文件名，端口不会被当成行号", () => {
+    const f = only("- Endpoint https://example.com:8080/v1 fails, see src/auth.ts:42.");
+    expect(f).toMatchObject({ file: "src/auth.ts", line: 42 });
+  });
+
+  it("完全没有定位信息的散文不编造文件名", () => {
+    const f = only("- This is a general design concern, e.g. about naming.");
+    expect(f?.file).toBeUndefined();
+    expect(f?.line).toBeUndefined();
+    // 描述本身必须完好——不能因为定位抽不出来就把发现一起丢掉
+    expect(f?.description).toContain("design concern");
+  });
+
+  it("只有文件名、没有行号时仍保留文件名", () => {
+    // 行号缺失时 GitHubReviewer 会跳过内联评论，但 location 文案里还会显示文件名，
+    // 所以这条能力要留住。
+    const f = only("- See src/auth.ts for the whole picture.");
+    expect(f).toMatchObject({ file: "src/auth.ts" });
+    expect(f?.line).toBeUndefined();
+  });
+
+  it("裸路径带行号时照常取到（无目录前缀的文件名）", () => {
+    const f = only("- README.md:12 needs clarification.");
+    expect(f).toMatchObject({ file: "README.md", line: 12 });
+  });
+});
+
+/**
+ * 行号在文件里不可能是 0、负数或小数。
+ *
+ * 旧的 `asNumber` 只判 `Number.isFinite`，而 `/^\d+$/` 只管字符串分支，number 分支
+ * 直接放行，于是 `line: 0` / `line: -5` / `line: 1.5` / `line: 99999999` 全被接受
+ * （实测四项都原样出现在解析结果里）。
+ *
+ * 下游目前**恰好**挡得住：`!finding.line` 丢掉 0，`isLineInNewDiff` 丢掉其余。
+ * 但那是两道「恰好挡下」的护栏，不是「本来就合法」—— 有人改下游就会退化。
+ */
+describe("line 必须是 1 起的整数", () => {
+  const lineOf = (raw: string) =>
+    ReviewParser.parseDetailed(raw).findings.high[0]?.line;
+
+  // 只列「不可能是行号」的值。99999999 **刻意不在这里** —— 它是正整数, 语法上合法,
+  // 是否合理该由「这个文件有没有这么多行」回答, 而那是 isLineInNewDiff 的职责。
+  it.each([
+    ["0", 0],
+    ["负数", -5],
+    ["小数", 1.5],
+  ])("line 为 %s 时被拒（实测这些原本都会被接受）", (_name, value) => {
+    expect(lineOf(`{"summary":"s","high":[{"file":"a.ts","line":${value},"description":"d"}]}`))
+      .toBeUndefined();
+  });
+
+  it("正整数原样保留", () => {
+    expect(lineOf('{"summary":"s","high":[{"file":"a.ts","line":42,"description":"d"}]}')).toBe(42);
+  });
+
+  it("纯十进制字符串行号仍被接受（字符串分支不得一起废掉）", () => {
+    expect(lineOf('{"summary":"s","high":[{"file":"a.ts","line":"42","description":"d"}]}')).toBe(42);
+  });
+
+  /**
+   * 行号**刻意不设上界**。
+   *
+   * 一开始我写了一条「99999999 应被拒」的断言, 实现没满足, 但复查后判定**断言错、
+   * 代码对**：它是正整数, 语法上完全可能是某个超大文件的真实行号。要判断它是否
+   * 合理, 得知道「这个文件有多少行」—— 那是 `GitHubReviewer.isLineInNewDiff` 的职责
+   * （它只放行落在该文件 diff 范围内的行号）。
+   *
+   * 而在这里加一个魔数上界**不改善任何后果**：99999999 行本来就被 isLineInNewDiff
+   * 挡掉并 warning 后丢弃, 加了上界只是把丢弃提前到解析器, 结果完全一样, 反而
+   * 引入一个新的可动变量（该定多大? 十万? 百万? 会不会误伤真实大文件?）。
+   * 能被安全拒掉的只有「不可能是行号」的那些：0、负数、小数。
+   */
+  it("不给行号设上界：超大正整数原样保留, 由下游按 diff 范围判定", () => {
+    expect(lineOf('{"summary":"s","high":[{"file":"a.ts","line":99999999,"description":"d"}]}'))
+      .toBe(99999999);
+  });
+
+  it("非十进制字符串行号被拒", () => {
+    expect(lineOf('{"summary":"s","high":[{"file":"a.ts","line":"4.2","description":"d"}]}')).toBeUndefined();
+  });
+});
+
