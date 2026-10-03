@@ -85,15 +85,82 @@ export class ReviewParser {
     }
   }
 
+  /**
+   * 从每个 `{` 出发按**配对**花括号取候选，而不是从第一个 `{` 贪心切到最后一个 `}`。
+   *
+   * 花括号在散文里极常见（"the {id} field"）。旧的贪心切片会把这些括号和真正的
+   * JSON 粘成一个字符串，`JSON.parse` 必然失败 ⇒ `usedJson` 变 false。而 `main.ts`
+   * 的重开判定是 `count === 0 && !usedJson` ⇒ 一个 JSON **完全合法**的干净 PR，
+   * 只要模型散文里提到过 `{...}`，就会被判成「模型没给出 JSON」，白白重开一个 CI
+   * （还先浪费一次 llm 重试）。实测：前置/后置/两端带花括号三种包装都会触发。
+   *
+   * 取**最长**的合法候选，而不是第一个：散文里完全可能出现
+   * `Consider {"k": 1} shape.` 这种合法 JSON 片段，「第一个能 parse 就用」会把它
+   * 当成 review JSON —— `summary` 取不到、findings 全空，于是**静默漏审**
+   * （fail-closed 被破成 fail-open），那比「白重开一次」严重得多。真正的 review
+   * JSON 总是最长的那个。
+   *
+   * 配对扫描顺带解决两个对象的情形（`{"a":1}` + 散文 + `{"b":2}`）：贪心切片必然
+   * 失败，配对扫描能分别取到它们。
+   *
+   * fail-closed 语义不变：真的没有 JSON 时仍返回 null，`usedJson` 仍是 false。
+   * 复杂度最坏 O(n²)（每个 `{` 一次扫描），但输出长度受 `max-output-tokens` 约束，
+   * 实测量级在毫秒，不需要为此再加魔数上限（那会引入新的可动变量）。
+   */
   private static extractJsonObject(rawText: string): string | null {
     const fencedJson = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
     if (fencedJson) return fencedJson[1].trim();
 
-    const start = rawText.indexOf("{");
-    const end = rawText.lastIndexOf("}");
-    if (start === -1 || end === -1 || end <= start) return null;
+    let best: string | null = null;
+    for (
+      let start = rawText.indexOf("{");
+      start !== -1;
+      start = rawText.indexOf("{", start + 1)
+    ) {
+      const candidate = this.sliceBalanced(rawText, start);
+      if (candidate === null) continue;
+      try {
+        JSON.parse(candidate);
+      } catch {
+        continue;
+      }
+      if (best === null || candidate.length > best.length) best = candidate;
+    }
 
-    return rawText.slice(start, end + 1).trim();
+    return best;
+  }
+
+  /**
+   * 从 `start`（必须指向 `{`）起按配对花括号截出一个对象。
+   * 字符串字面量里的括号不算，转义引号也不算。
+   */
+  private static sliceBalanced(text: string, start: number): string | null {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (inString && ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') {
+        inString = !inString;
+        continue;
+      }
+      if (inString) continue;
+      if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) return text.slice(start, i + 1).trim();
+      }
+    }
+    return null;
   }
 
   private static normalizeFindings(value: unknown, severity: ReviewFinding["severity"]): ReviewFinding[] {
