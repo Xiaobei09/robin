@@ -1,0 +1,48 @@
+name: Retry Robin
+
+# 目标仓库（消费方）专用：把「Robin 审查失败」变成一次自动重开。
+#
+# 放在**目标仓库**，不是 antongulin/robin。`workflow_run` 只会在触发它的
+# workflow 所在的仓库内匹配，Robin 自己仓库里的同名文件永远不会触发。
+#
+# `workflows: [Robin]` 必须逐字等于目标仓库 `robin.yml` 顶部的 `name:`。
+# 写错（包括大小写差异）只会静默不触发，没有任何报错，所以改名前先核一遍：
+#   grep -m1 '^name:' .github/workflows/robin.yml
+
+on:
+  workflow_run:
+    workflows: ["Robin"]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+# 同一 PR 上串行重开：并发 rerun 同一个 run 会被 API 拒绝。
+concurrency:
+  group: retry-robin-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  rerun:
+    # run_attempt 从 1 开始（首次运行）。< 3 => 首次 + 最多 2 次重启，共 3 次。
+    # 第 3 次（attempt == 3）失败后不再重开，交给人来看，否则会无限循环。
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt < 3
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Rerun Robin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          echo "Robin run $RUN_ID failed (attempt ${{ github.event.workflow_run.run_attempt }}); rerunning."
+          # 整条流水线重跑，不加 --failed。
+          # --failed 只会重跑失败的 job，而审查流程的失败几乎总是「LLM 出口/解析」这类
+          # 外部原因，重跑单个 job 等于拿同一批坏输入再算一遍，必然同样失败。
+          gh run rerun "$RUN_ID"

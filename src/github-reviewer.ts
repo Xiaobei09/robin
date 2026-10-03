@@ -5,6 +5,210 @@ import { StructuredReview, ReviewFinding } from "./review-parser";
 /** Marker present in every Robin review body; used to recognize Robin's own reviews. */
 export const ROBIN_SIGNATURE = ":bow_and_arrow: Robin";
 
+/**
+ * The single invisible marker identifying *the* Robin comment on a PR.
+ *
+ * **为什么只有一个 marker。** 之前 Robin 有两个身份标记：`ROBIN_SIGNATURE`
+ * （`:bow_and_arrow: Robin`，靠文本匹配，只能用于 review 对象）和
+ * `<!-- robin:status -->`（只盖状态评论）。工作流失败自动重启之后，状态评论
+ * 走「认领上一条」，于是 PR 上会留下一条 `<!-- robin:status -->` 的状态评论，
+ * 外加每次重启各自新发的内容 —— 读者看到的是「同一个人在说话，但说了好几遍」。
+ *
+ * 现在两类评论共用 `REVIEW_MARKER`，查找条件是「作者是 `github-actions[bot]`
+ * 且正文含 marker」，find-then-create-or-update 之后**至多一条**：重启只 PATCH，
+ * 绝不 POST 第二条。
+ */
+export const REVIEW_MARKER = "<!-- robin-ai-review -->";
+
+/** The login GitHub Actions commits comment as; half of the identity check. */
+export const ROBIN_BOT_LOGIN = "github-actions[bot]";
+
+/** A Robin-owned issue comment that a later run may adopt instead of creating a new one. */
+export interface RobinComment {
+  id: number;
+  body: string;
+}
+
+/**
+ * Put the marker at the very start of a body, exactly once.
+ *
+ * **为什么放开头而不是结尾。** marker 必须在首行，否则 GitHub 在渲染成 HTML 后
+ * 会把它跟正文之间插入一个 `<p>`，用 `startsWith` 认领就会失配。
+ *
+ * 幂等：已经以 marker 开头（含前后空白）的正文原样返回，所以重试同一段文本
+ * 不会累积出 `<!-- robin-ai-review --><!-- robin-ai-review -->`。
+ */
+export function decorateRobinCommentBody(body: string): string {
+  const text = typeof body === "string" ? body : "";
+  return text.trimStart().startsWith(REVIEW_MARKER) ? text : REVIEW_MARKER + "\n" + text;
+}
+
+/** The narrow slice of octokit the comment helpers touch. */
+type RobinCommentClient = {
+  paginate?: (
+    route: unknown,
+    params: { owner: string; repo: string; issue_number: number; per_page: number }
+  ) => Promise<unknown>;
+  rest?: {
+    issues?: {
+      listComments?: unknown;
+      createComment?: unknown;
+      updateComment?: unknown;
+      deleteComment?: unknown;
+    };
+  };
+};
+
+/**
+ * The newest Robin comment on the issue, or undefined when there is none.
+ *
+ * Paginated with `per_page=100` and walked end-to-start so the *most recent*
+ * marked comment wins: a PR with >100 comments (very common once humans pile in)
+ * must still find its marker on a later page instead of silently concluding
+ * "no comment yet" and posting a second one.
+ *
+ * Best-effort, like every other listing here: any API failure returns undefined so
+ * the caller falls back to creating a comment rather than failing the run.
+ */
+export async function findExistingReviewComment(
+  octokit: unknown,
+  owner: string,
+  repo: string,
+  issueNumber: number
+): Promise<RobinComment | undefined> {
+  const client = octokit as RobinCommentClient;
+  const paginate = client?.paginate;
+  const listComments = client?.rest?.issues?.listComments;
+  if (typeof paginate !== "function" || !listComments) return undefined;
+  try {
+    const comments = await paginate.call(octokit, listComments, {
+      owner,
+      repo,
+      issue_number: issueNumber,
+      per_page: 100,
+    });
+    if (!Array.isArray(comments)) return undefined;
+    for (let i = comments.length - 1; i >= 0; i--) {
+      const comment = comments[i] as { id?: unknown; body?: unknown; user?: { login?: unknown } | null };
+      const id = Number(comment?.id);
+      if (!Number.isFinite(id)) continue;
+      // Both halves matter: a human who quoted the marker (or a bot relaying one)
+      // must never be adopted — overwriting a human's words is unrecoverable.
+      if (comment?.user?.login !== ROBIN_BOT_LOGIN) continue;
+      if (typeof comment?.body !== "string" || !comment.body.includes(REVIEW_MARKER)) continue;
+      return { id, body: comment.body as string };
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Adopt Robin's existing comment if there is one, otherwise create it.
+ *
+ * This is the whole restart story in one function: run 2 PATCHes run 1's comment
+ * instead of POSTing a sibling, so three runs leave exactly one comment on the PR.
+ * Returns the comment id so the caller can keep updating it for the rest of the run.
+ */
+export async function publishRobinComment(
+  octokit: unknown,
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  body: string
+): Promise<number | undefined> {
+  const client = octokit as RobinCommentClient;
+  const decorated = decorateRobinCommentBody(body);
+  const existing = await findExistingReviewComment(octokit, owner, repo, issueNumber);
+
+  if (existing) {
+    try {
+      const update = client?.rest?.issues?.updateComment;
+      if (typeof update === "function") {
+        await (update as Function).call(octokit, {
+          owner,
+          repo,
+          comment_id: existing.id,
+          body: decorated,
+        });
+        return existing.id;
+      }
+    } catch (error) {
+      // A stale/deleted comment id must not sink the run: fall through and re-create.
+      core.warning("Could not update Robin comment #" + existing.id + ", recreating: " + error);
+    }
+  }
+
+  try {
+    const create = client?.rest?.issues?.createComment;
+    if (typeof create !== "function") return undefined;
+    const response = (await (create as Function).call(octokit, {
+      owner,
+      repo,
+      issue_number: issueNumber,
+      body: decorated,
+    })) as { data?: { id?: unknown } };
+    const id = Number(response?.data?.id);
+    return Number.isFinite(id) ? id : undefined;
+  } catch (error) {
+    core.warning("Could not post Robin comment: " + error);
+    return undefined;
+  }
+}
+
+/**
+ * Delete Robin's *other* marked comments, keeping `keepId`.
+ *
+ * Only pre-existing duplicates are removed — comments authored by a human are
+ * never touched, and a single failure to delete one is logged and skipped so a
+ * cleanup problem can never fail a review.
+ */
+export async function deletePreviousReviewComments(
+  octokit: unknown,
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  keepId: number | undefined
+): Promise<number> {
+  const client = octokit as RobinCommentClient;
+  const paginate = client?.paginate;
+  const listComments = client?.rest?.issues?.listComments;
+  const deleteComment = client?.rest?.issues?.deleteComment;
+  if (typeof paginate !== "function" || !listComments || typeof deleteComment !== "function") return 0;
+
+  try {
+    const comments = (await paginate.call(octokit, listComments, {
+      owner,
+      repo,
+      issue_number: issueNumber,
+      per_page: 100,
+    })) as Array<{ id?: unknown; user?: { login?: unknown } | null }>;
+    if (!Array.isArray(comments)) return 0;
+
+    let deleted = 0;
+    for (const comment of comments) {
+      const id = Number(comment?.id);
+      if (!Number.isFinite(id) || id === keepId) continue;
+      if (comment?.user?.login !== ROBIN_BOT_LOGIN) continue;
+      try {
+        await (deleteComment as Function).call(octokit, {
+          owner,
+          repo,
+          comment_id: id,
+        });
+        deleted++;
+      } catch (error) {
+        core.warning("Could not delete duplicate Robin comment #" + id + ": " + error);
+      }
+    }
+    return deleted;
+  } catch (error) {
+    core.warning("Could not list Robin comments for cleanup: " + error);
+    return 0;
+  }
+}
+
 export class GitHubReviewer {
   private octokit: Octokit;
   private maxComments: number;

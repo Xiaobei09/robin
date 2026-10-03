@@ -114,22 +114,40 @@ function parseStrictNumber(input) {
         return { value: Number.NaN, valid: false };
     return { value: parsed, valid: true };
 }
+/**
+ * 解析 `llm-timeout-ms`。
+ *
+ * **`undefined` 表示「未配置」，与任何具体数字都不同。** 这一层必须保留这个区分，
+ * 否则下游 `resolveLlmTimeoutMs` 只能拿「值是否等于 `DEFAULT_LLM_TIMEOUT_MS`」
+ * 去猜用户有没有配过 —— 而用户显式写 `600000`（与默认值同数）就会被误判成没配，
+ * 对 OpenRouter 路由模型静默降级成 120000ms，推理模型慢的 PR 必然超时。
+ *
+ * 与 `parseLLMMaxAttempts` 同一套制度（那边把「未配置」留给构造默认值 +
+ * OpenRouter 例外接手），也是 `action.yml` 里 `default: ""` 的原因。
+ */
 function parseLLMTimeout(input) {
     if (!input)
-        return { value: exports.DEFAULT_LLM_TIMEOUT_MS, valid: true };
+        return { value: undefined, valid: true };
     const { value: parsed, valid } = parseStrictNumber(input);
     if (valid && parsed > 0) {
         return { value: parsed, valid: true };
     }
-    return { value: exports.DEFAULT_LLM_TIMEOUT_MS, valid: false };
+    return { value: undefined, valid: false };
 }
 function parseLLMTemperature(input) {
     const trimmed = input.trim();
     if (!trimmed)
         return { value: exports.DEFAULT_LLM_TEMPERATURE, valid: true };
-    const parsed = Number(trimmed);
+    // 走 parseStrictNumber，而不是裸 `Number()` —— 理由见该函数上方注释：
+    // `Number` 会照猜的读，把拼写错误变成一个合法但完全不同的数。
+    // 具体到温度，漏判的后果实测如下（都是 valid:true，日志一句警告都不会有）：
+    //   "0x2"    → 2   ← 十六进制字面量，静默把温度顶到 MAX_LLM_TEMPERATURE
+    //   "1e-400" → 0   ← 下溢成 0，与默认的 0.1 行为不同却看不出任何异常
+    //   "+1" / "1." → 1 ← 带符号 / 尾点写法同样被"猜"出来
+    // 温度直接决定采样多样性，静默落到上限 2 是最难察觉的一类配置漂移。
+    const { value: parsed, valid } = parseStrictNumber(input);
     // 0 is a legitimate value, so range-check instead of truthiness.
-    if (Number.isFinite(parsed) && parsed >= 0 && parsed <= exports.MAX_LLM_TEMPERATURE) {
+    if (valid && parsed >= 0 && parsed <= exports.MAX_LLM_TEMPERATURE) {
         return { value: parsed, valid: true };
     }
     return { value: exports.DEFAULT_LLM_TEMPERATURE, valid: false };
@@ -154,9 +172,15 @@ function parseLLMMaxAttempts(input) {
     const trimmed = input.trim();
     if (!trimmed)
         return { value: undefined, valid: true };
-    const parsed = Number(trimmed);
+    // 同样走 parseStrictNumber。这一处的漏判后果比温度更实在：
+    //   "1e1" → 10   ← 科学计数法静默变成「上限 10 次尝试」，放大 10 倍的出口压力
+    //   "0x3" → 3    "0b11" → 3    "2e0" → 2
+    // 全部 valid:true，调用方（main.ts）只在 !valid 时告警 ⇒ 一声不吭地生效。
+    // 「未配置」与「拼错的配置」在这里代价特别不一样：拼错 ⇒ 反复打 provider。
+    const { value: parsed, valid } = parseStrictNumber(input);
     // Integer check: "2.5" attempts is meaningless, and Math.floor would hide a typo.
-    if (Number.isInteger(parsed) &&
+    if (valid &&
+        Number.isInteger(parsed) &&
         parsed >= exports.MIN_LLM_COMPLETION_ATTEMPTS &&
         parsed <= exports.MAX_LLM_COMPLETION_ATTEMPTS) {
         return { value: parsed, valid: true };
@@ -399,10 +423,184 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.GitHubReviewer = exports.ROBIN_SIGNATURE = void 0;
+exports.GitHubReviewer = exports.ROBIN_BOT_LOGIN = exports.REVIEW_MARKER = exports.ROBIN_SIGNATURE = void 0;
+exports.decorateRobinCommentBody = decorateRobinCommentBody;
+exports.findExistingReviewComment = findExistingReviewComment;
+exports.publishRobinComment = publishRobinComment;
+exports.deletePreviousReviewComments = deletePreviousReviewComments;
 const core = __importStar(__nccwpck_require__(7484));
 /** Marker present in every Robin review body; used to recognize Robin's own reviews. */
 exports.ROBIN_SIGNATURE = ":bow_and_arrow: Robin";
+/**
+ * The single invisible marker identifying *the* Robin comment on a PR.
+ *
+ * **为什么只有一个 marker。** 之前 Robin 有两个身份标记：`ROBIN_SIGNATURE`
+ * （`:bow_and_arrow: Robin`，靠文本匹配，只能用于 review 对象）和
+ * `<!-- robin:status -->`（只盖状态评论）。工作流失败自动重启之后，状态评论
+ * 走「认领上一条」，于是 PR 上会留下一条 `<!-- robin:status -->` 的状态评论，
+ * 外加每次重启各自新发的内容 —— 读者看到的是「同一个人在说话，但说了好几遍」。
+ *
+ * 现在两类评论共用 `REVIEW_MARKER`，查找条件是「作者是 `github-actions[bot]`
+ * 且正文含 marker」，find-then-create-or-update 之后**至多一条**：重启只 PATCH，
+ * 绝不 POST 第二条。
+ */
+exports.REVIEW_MARKER = "<!-- robin-ai-review -->";
+/** The login GitHub Actions commits comment as; half of the identity check. */
+exports.ROBIN_BOT_LOGIN = "github-actions[bot]";
+/**
+ * Put the marker at the very start of a body, exactly once.
+ *
+ * **为什么放开头而不是结尾。** marker 必须在首行，否则 GitHub 在渲染成 HTML 后
+ * 会把它跟正文之间插入一个 `<p>`，用 `startsWith` 认领就会失配。
+ *
+ * 幂等：已经以 marker 开头（含前后空白）的正文原样返回，所以重试同一段文本
+ * 不会累积出 `<!-- robin-ai-review --><!-- robin-ai-review -->`。
+ */
+function decorateRobinCommentBody(body) {
+    const text = typeof body === "string" ? body : "";
+    return text.trimStart().startsWith(exports.REVIEW_MARKER) ? text : exports.REVIEW_MARKER + "\n" + text;
+}
+/**
+ * The newest Robin comment on the issue, or undefined when there is none.
+ *
+ * Paginated with `per_page=100` and walked end-to-start so the *most recent*
+ * marked comment wins: a PR with >100 comments (very common once humans pile in)
+ * must still find its marker on a later page instead of silently concluding
+ * "no comment yet" and posting a second one.
+ *
+ * Best-effort, like every other listing here: any API failure returns undefined so
+ * the caller falls back to creating a comment rather than failing the run.
+ */
+async function findExistingReviewComment(octokit, owner, repo, issueNumber) {
+    const client = octokit;
+    const paginate = client?.paginate;
+    const listComments = client?.rest?.issues?.listComments;
+    if (typeof paginate !== "function" || !listComments)
+        return undefined;
+    try {
+        const comments = await paginate.call(octokit, listComments, {
+            owner,
+            repo,
+            issue_number: issueNumber,
+            per_page: 100,
+        });
+        if (!Array.isArray(comments))
+            return undefined;
+        for (let i = comments.length - 1; i >= 0; i--) {
+            const comment = comments[i];
+            const id = Number(comment?.id);
+            if (!Number.isFinite(id))
+                continue;
+            // Both halves matter: a human who quoted the marker (or a bot relaying one)
+            // must never be adopted — overwriting a human's words is unrecoverable.
+            if (comment?.user?.login !== exports.ROBIN_BOT_LOGIN)
+                continue;
+            if (typeof comment?.body !== "string" || !comment.body.includes(exports.REVIEW_MARKER))
+                continue;
+            return { id, body: comment.body };
+        }
+        return undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
+ * Adopt Robin's existing comment if there is one, otherwise create it.
+ *
+ * This is the whole restart story in one function: run 2 PATCHes run 1's comment
+ * instead of POSTing a sibling, so three runs leave exactly one comment on the PR.
+ * Returns the comment id so the caller can keep updating it for the rest of the run.
+ */
+async function publishRobinComment(octokit, owner, repo, issueNumber, body) {
+    const client = octokit;
+    const decorated = decorateRobinCommentBody(body);
+    const existing = await findExistingReviewComment(octokit, owner, repo, issueNumber);
+    if (existing) {
+        try {
+            const update = client?.rest?.issues?.updateComment;
+            if (typeof update === "function") {
+                await update.call(octokit, {
+                    owner,
+                    repo,
+                    comment_id: existing.id,
+                    body: decorated,
+                });
+                return existing.id;
+            }
+        }
+        catch (error) {
+            // A stale/deleted comment id must not sink the run: fall through and re-create.
+            core.warning("Could not update Robin comment #" + existing.id + ", recreating: " + error);
+        }
+    }
+    try {
+        const create = client?.rest?.issues?.createComment;
+        if (typeof create !== "function")
+            return undefined;
+        const response = (await create.call(octokit, {
+            owner,
+            repo,
+            issue_number: issueNumber,
+            body: decorated,
+        }));
+        const id = Number(response?.data?.id);
+        return Number.isFinite(id) ? id : undefined;
+    }
+    catch (error) {
+        core.warning("Could not post Robin comment: " + error);
+        return undefined;
+    }
+}
+/**
+ * Delete Robin's *other* marked comments, keeping `keepId`.
+ *
+ * Only pre-existing duplicates are removed — comments authored by a human are
+ * never touched, and a single failure to delete one is logged and skipped so a
+ * cleanup problem can never fail a review.
+ */
+async function deletePreviousReviewComments(octokit, owner, repo, issueNumber, keepId) {
+    const client = octokit;
+    const paginate = client?.paginate;
+    const listComments = client?.rest?.issues?.listComments;
+    const deleteComment = client?.rest?.issues?.deleteComment;
+    if (typeof paginate !== "function" || !listComments || typeof deleteComment !== "function")
+        return 0;
+    try {
+        const comments = (await paginate.call(octokit, listComments, {
+            owner,
+            repo,
+            issue_number: issueNumber,
+            per_page: 100,
+        }));
+        if (!Array.isArray(comments))
+            return 0;
+        let deleted = 0;
+        for (const comment of comments) {
+            const id = Number(comment?.id);
+            if (!Number.isFinite(id) || id === keepId)
+                continue;
+            if (comment?.user?.login !== exports.ROBIN_BOT_LOGIN)
+                continue;
+            try {
+                await deleteComment.call(octokit, {
+                    owner,
+                    repo,
+                    comment_id: id,
+                });
+                deleted++;
+            }
+            catch (error) {
+                core.warning("Could not delete duplicate Robin comment #" + id + ": " + error);
+            }
+        }
+        return deleted;
+    }
+    catch (error) {
+        core.warning("Could not list Robin comments for cleanup: " + error);
+        return 0;
+    }
+}
 class GitHubReviewer {
     octokit;
     maxComments;
@@ -763,7 +961,12 @@ class LLMClient {
     reasoningEffort;
     reasoningFallbackActive = false;
     reasoningFallbackReason;
-    constructor(baseUrl, apiKey, model, maxOutputTokens, timeoutMs = config_1.DEFAULT_LLM_TIMEOUT_MS, maxAttempts = config_1.DEFAULT_LLM_COMPLETION_ATTEMPTS, temperature = config_1.DEFAULT_LLM_TEMPERATURE, onProgress, reasoningEffort) {
+    constructor(baseUrl, apiKey, model, maxOutputTokens, 
+    // 刻意**不给**默认值。给了就会把「未配置」变成 DEFAULT_LLM_TIMEOUT_MS，
+    // 于是 resolveLlmTimeoutMs 无法区分「没配」与「显式配了 600000」，
+    // 后者会被对 OpenRouter 路由模型静默降级成 120000ms。
+    // 传 undefined 一路传到 resolveLlmTimeoutMs，由它按模型选默认值。
+    timeoutMs, maxAttempts = config_1.DEFAULT_LLM_COMPLETION_ATTEMPTS, temperature = config_1.DEFAULT_LLM_TEMPERATURE, onProgress, reasoningEffort) {
         this.model = model;
         this.temperature = temperature;
         this.routerModel = (0, llm_retry_1.isOpenRouterRouterModel)(model);
@@ -1038,11 +1241,29 @@ exports.getLlmCompletionAttemptCount = getLlmCompletionAttemptCount;
 exports.delayMs = delayMs;
 exports.openRouterStallError = openRouterStallError;
 const config_1 = __nccwpck_require__(4008);
-/** OpenRouter routers (e.g. openrouter/free) pick models dynamically — no secret updates needed. */
+/**
+ * 把 LLM 请求超时解析成实际生效的毫秒数。
+ *
+ * **`timeoutMs` 必须能表达「未配置」。** 这里的判据是 `undefined` 而不是
+ * 「值恰好等于 `DEFAULT_LLM_TIMEOUT_MS`」—— 后者曾导致一个静默降级：
+ * 用户在 workflow 里**显式**写 `llm-timeout-ms: 600000`，与 action 自带的默认值
+ * 是同一个数，于是被判成「没配」，对 OpenRouter 路由模型悄悄改成 120000。
+ * 用户显式调高 timeout 通常正是因为推理模型慢，被打回 2 分钟必然超时。
+ *
+ * 为什么这个不对称是缺陷而不仅是巧合：同文件的 `getLlmCompletionAttemptCount`
+ * 也用 `=== DEFAULT` 做同样的判据，但方向是 3 → 5（**往上**，更保守），
+ * 混淆无害；这里是 600000 → 120000（**往下**），直接推翻用户的显式选择。
+ *
+ * 根因在 action.yml 那一层的 `default: "600000"`：默认值被提前填好，
+ * 「未配置」这一态根本到不了这里。`llm-max-attempts` 的 `default: ""` 正是
+ * 为此而设（描述里明写 "Leave empty to keep the built-in default"），
+ * 现在 `llm-timeout-ms` 补上同一套。
+ */
 function resolveLlmTimeoutMs(model, timeoutMs) {
-    if (timeoutMs !== config_1.DEFAULT_LLM_TIMEOUT_MS)
+    // 显式配置（哪怕恰好等于默认值）必须原样尊重。
+    if (typeof timeoutMs === "number" && Number.isFinite(timeoutMs))
         return timeoutMs;
-    return isOpenRouterRouterModel(model) ? config_1.DEFAULT_LLM_ROUTER_TIMEOUT_MS : timeoutMs;
+    return isOpenRouterRouterModel(model) ? config_1.DEFAULT_LLM_ROUTER_TIMEOUT_MS : config_1.DEFAULT_LLM_TIMEOUT_MS;
 }
 function isOpenRouterRouterModel(model) {
     if (!model)
@@ -1604,7 +1825,10 @@ async function run() {
         const llmTimeoutMsInput = core.getInput("llm-timeout-ms") || "";
         const { value: llmTimeoutMs, valid: llmTimeoutValid } = (0, config_1.parseLLMTimeout)(llmTimeoutMsInput);
         if (!llmTimeoutValid) {
-            core.warning(`Invalid llm-timeout-ms value "${llmTimeoutMsInput}", using default ${config_1.DEFAULT_LLM_TIMEOUT_MS}`);
+            // 不能在这里写死 DEFAULT_LLM_TIMEOUT_MS：解析失败会退回「未配置」，
+            // 而未配置的超时由 resolveLlmTimeoutMs 按模型决定（OpenRouter 路由模型
+            // 是 DEFAULT_LLM_ROUTER_TIMEOUT_MS）。文案说 600000 会与实际生效值不符。
+            core.warning(`Invalid llm-timeout-ms value "${llmTimeoutMsInput}", using the built-in default`);
         }
         const llmTemperatureInput = core.getInput("llm-temperature") || "";
         const { value: llmTemperature, valid: llmTemperatureValid } = (0, config_1.parseLLMTemperature)(llmTemperatureInput);
@@ -1901,20 +2125,16 @@ async function addEyesReaction(octokit, owner, repo, commentId) {
         core.warning(`Could not add eyes reaction to trigger comment: ${error}`);
     }
 }
+/**
+ * Post Robin's single comment for this run — or adopt the one already there.
+ *
+ * Delegates to `publishRobinComment`, which does the paginated lookup and then either
+ * PATCHes the existing marker-carrying comment or POSTs a new one. That is the entire
+ * restart story: run 2 rewrites run 1's comment instead of adding a sibling, so a PR
+ * whose review workflow failed twice still shows exactly one Robin comment.
+ */
 async function postStatusComment(octokit, owner, repo, issueNumber, command, model, inheritedVerdict) {
-    try {
-        const { data } = await octokit.rest.issues.createComment({
-            owner,
-            repo,
-            issue_number: issueNumber,
-            body: (0, status_comment_1.decorateStatusCommentBody)((0, status_comment_1.buildInitialStatusBody)(command === "summary" ? "summary" : "review", model, inheritedVerdict)),
-        });
-        return data.id;
-    }
-    catch (error) {
-        core.warning(`Could not post status comment: ${error}`);
-        return undefined;
-    }
+    return (0, github_reviewer_1.publishRobinComment)(octokit, owner, repo, issueNumber, (0, status_comment_1.buildInitialStatusBody)(command === "summary" ? "summary" : "review", model, inheritedVerdict));
 }
 async function updateStatusComment(octokit, owner, repo, commentId, body) {
     if (!commentId)
@@ -1938,17 +2158,30 @@ async function updateStatusComment(octokit, owner, repo, commentId, body) {
  * "On it" comments and the newest could scroll out of view. A retried run now updates the
  * existing comment in place and carries the previous verdict forward, so the evaluation the
  * reader could already see is inherited instead of vanishing the moment a retry starts.
+ *
+ * Whichever branch it takes, it then drops Robin's *other* marked comments. Those only exist
+ * on PRs reviewed before the marker was unified, but leaving them behind is exactly the
+ * pile-up this function exists to remove — and it can only ever touch comments authored by
+ * `github-actions[bot]`, never a human's.
  */
 async function resolveStatusCommentId(octokit, owner, repo, issueNumber, command, model) {
     const existing = await (0, status_comment_1.findLatestStatusComment)(octokit, owner, repo, issueNumber);
+    let statusCommentId;
     if (!existing) {
-        return postStatusComment(octokit, owner, repo, issueNumber, command, model);
+        statusCommentId = await postStatusComment(octokit, owner, repo, issueNumber, command, model);
     }
-    const inheritedVerdict = (0, status_comment_1.extractInheritedVerdict)(existing.body);
-    core.info(`Adopting Robin status comment #${existing.id} from a previous run` +
-        (inheritedVerdict ? ` (carrying over: ${inheritedVerdict})` : ""));
-    await updateStatusComment(octokit, owner, repo, existing.id, (0, status_comment_1.buildInitialStatusBody)(command === "summary" ? "summary" : "review", model, inheritedVerdict));
-    return existing.id;
+    else {
+        const inheritedVerdict = (0, status_comment_1.extractInheritedVerdict)(existing.body);
+        core.info(`Adopting Robin status comment #${existing.id} from a previous run` +
+            (inheritedVerdict ? ` (carrying over: ${inheritedVerdict})` : ""));
+        await updateStatusComment(octokit, owner, repo, existing.id, (0, status_comment_1.buildInitialStatusBody)(command === "summary" ? "summary" : "review", model, inheritedVerdict));
+        statusCommentId = existing.id;
+    }
+    const removed = await (0, github_reviewer_1.deletePreviousReviewComments)(octokit, owner, repo, issueNumber, statusCommentId);
+    if (removed > 0) {
+        core.info(`Removed ${removed} duplicate Robin comment(s) from earlier runs.`);
+    }
+    return statusCommentId;
 }
 function buildCompletedStatusBody(command, findings, reasoningFallbackReason) {
     const fallbackNotice = (0, reasoning_fallback_1.buildReasoningFallbackNotice)(reasoningFallbackReason);
@@ -2381,7 +2614,7 @@ function buildReasoningFallbackNotice(reason) {
  *    不依赖任何外部存储，所以新 run 读回自己的上一跳即可。
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.DEFAULT_RELAUNCH_ON_EGRESS_FAILURE = exports.DEFAULT_MAX_RELAUNCHES = exports.RELAUNCH_MARKER = exports.RELAUNCH_COMMAND = void 0;
+exports.MAX_RELAUNCHES = exports.DEFAULT_RELAUNCH_ON_EGRESS_FAILURE = exports.DEFAULT_MAX_RELAUNCHES = exports.RELAUNCH_MARKER = exports.RELAUNCH_COMMAND = void 0;
 exports.resolveMaxRelaunches = resolveMaxRelaunches;
 exports.resolveRelaunchOnEgressFailure = resolveRelaunchOnEgressFailure;
 exports.resolveHeadSha = resolveHeadSha;
@@ -2391,6 +2624,7 @@ exports.buildRelaunchCommentBody = buildRelaunchCommentBody;
 exports.isGithubActionsToken = isGithubActionsToken;
 exports.planRelaunch = planRelaunch;
 const llm_retry_1 = __nccwpck_require__(4069);
+const config_1 = __nccwpck_require__(4008);
 /** 触发新 CI 的命令前缀。必须是整个正文的开头，见上方约束 1。 */
 exports.RELAUNCH_COMMAND = "/robin";
 /** 机器可读标记：新 run 靠它认出「这是上一次自己发的重启评论」并取回 hop。 */
@@ -2399,18 +2633,46 @@ exports.RELAUNCH_MARKER = "<!-- robin:relaunch -->";
 exports.DEFAULT_MAX_RELAUNCHES = 2;
 /** 默认开启：出口被阻断时换一个 CI 继续，正是这个 action 存在的意义。 */
 exports.DEFAULT_RELAUNCH_ON_EGRESS_FAILURE = true;
+/**
+ * 重启次数的硬上限。
+ *
+ * 这道护栏的作用就是「别让出口故障把维护者的 CI 配额烧光」，所以它自己必须有上界。
+ * 修之前**根本没有上界**：`Number("1e3")` 是 1000，于是 `llm-max-relaunches: 1e3`
+ * 会让同一次审查重启 1000 次 —— 正是本文件开头明令禁止的「无限重启 CI」。
+ * 值取得和 `MAX_LLM_COMPLETION_ATTEMPTS`（同为 10）一致：默认的 5 倍，足够宽裕，
+ * 又足以挡住笔误与脚本生成的怪值。
+ */
+exports.MAX_RELAUNCHES = 10;
 function resolveMaxRelaunches(raw) {
     if (raw === undefined || raw === null || String(raw).trim() === "") {
         return exports.DEFAULT_MAX_RELAUNCHES;
     }
-    const parsed = Number(String(raw).trim());
-    // 非数字（用户笔误）：用文档化默认值，从宽。
-    if (!Number.isFinite(parsed))
+    const trimmed = String(raw).trim();
+    // 负数：夹到 0，也就是彻底关掉重启。这里必须 fail closed 而不是 fail open ——
+    // 把 "-1" 悄悄当成"允许重启 2 次"会让这道护栏朝更松的方向失效，
+    // 正是它本该防住的事故。
+    //
+    // 必须**先于** parseStrictNumber 处理：`parseStrictNumber` 按设计只接受纯十进制
+    // 写法（连 `+1` / `1.` 都拒，见 config.ts），所以 `-1` 会落到下面的"无效"分支
+    // 拿到默认值 2 —— 恰好是本段最要防的那个方向。负号是有意义的语义，不是拼写错误。
+    if (trimmed.startsWith("-"))
+        return 0;
+    // 走 parseStrictNumber 而不是裸 `Number()`：后者会把十六进制/二进制/科学计数法
+    // 「照猜的读」成一个合法数字。实测 `1e1` → 10（静默把上限抬到 5 倍）、
+    // `0b11` → 3、`1e3` → 1000，全部外观合法、零告警。
+    // 判定「什么算合法数字写法」只应有一处（config.ts 的 parseStrictNumber），
+    // 各文件自己写 `Number()` 就是这种漂移的来源。
+    const { value: parsed, valid } = (0, config_1.parseStrictNumber)(trimmed);
+    // 非数字**以及**非十进制写法（都是用户笔误）：用文档化默认值，从宽。
+    // 这里从宽是安全的 —— 默认值 2 本身有界，而把 `1e3` 当成合法才是危险的。
+    if (!valid)
         return exports.DEFAULT_MAX_RELAUNCHES;
-    // 数字但越界（负数/小数）：**夹到 0**，也就是彻底关掉重启。
-    // 这里必须 fail closed 而不是 fail open —— 把 "-1" 悄悄当成"允许重启 2 次"
-    // 会让这道护栏朝更松的方向失效，正是它本该防住的事故。
-    return Math.max(0, Math.floor(parsed));
+    // 小数（如 "2.9" 次重启）没有意义。向下取整是**保守**方向：不会超过调用方
+    // 要求的次数，2.9 次本就该读作 2 次。（不要改成夹到 0 —— 既有测试钉的是
+    // `2.9 → 2`，且从宽的这一侧并不放松护栏。原先此处"小数夹到 0"的注释与代码不符。）
+    const whole = Math.floor(parsed);
+    // 超上限：夹到上限而不是退回默认值 —— 既保住调用方的意图，又保证有界。
+    return Math.min(whole, exports.MAX_RELAUNCHES);
 }
 function resolveRelaunchOnEgressFailure(raw) {
     if (raw === undefined || raw === null || String(raw).trim() === "") {
@@ -2986,10 +3248,46 @@ class ReviewParser {
      * 复杂度最坏 O(n²)（每个 `{` 一次扫描），但输出长度受 `max-output-tokens` 约束，
      * 实测量级在毫秒，不需要为此再加魔数上限（那会引入新的可动变量）。
      */
+    /**
+     * 先试所有围栏块，再退到配对扫描，两条路都不中才返回 null。
+     *
+     * **为什么围栏块不能提前返回。** 旧实现只要看到 ``` 围栏就把块内容原样返回，
+     * 于是配对扫描这层兜底**一次都不会执行**。而模型很爱在正文里贴代码片段：
+     *
+     *   Here is the relevant code:
+     *   ```ts
+     *   const a = { x: 1 };
+     *   ```
+     *   And my review:
+     *   {"summary":"found a bug","high":[…]}
+     *
+     * 这时围栏块装的是 `ts\nconst a = { x: 1 };`，不是 review JSON。提前返回 ⇒
+     * `parseJsonReview` 的 `JSON.parse` 失败 ⇒ 返回 null ⇒ `usedJson=false`、
+     * findings 全空。而 `main.ts` 的重开判定是 `count === 0 && !usedJson`
+     * ⇒ 一个**带着真实高危发现**的 PR 被判成「模型没给出 JSON」，白白重开 CI，
+     * 审查结论直接丢失。
+     *
+     * 这与 R927 同一族、方向相反：那次是散文里的 `{...}` 污染了**合法** JSON；
+     * 这次是无关围栏**遮蔽**了真 JSON。两次都是「取 JSON」这一步的旁路先炸。
+     *
+     * 围栏块现在只是**候选之一**：逐个试 `JSON.parse`，不中就继续看下一个，
+     * 全不中再走配对扫描。真正的 review JSON 通常在 ```json 块里，这条优先路径保留。
+     */
     static extractJsonObject(rawText) {
-        const fencedJson = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-        if (fencedJson)
-            return fencedJson[1].trim();
+        const fencePattern = /```(?:json)?\s*([\s\S]*?)\s*```/gi;
+        let match;
+        while ((match = fencePattern.exec(rawText)) !== null) {
+            const candidate = match[1].trim();
+            if (!candidate)
+                continue;
+            try {
+                JSON.parse(candidate);
+            }
+            catch {
+                continue;
+            }
+            return candidate;
+        }
         let best = null;
         for (let start = rawText.indexOf("{"); start !== -1; start = rawText.indexOf("{", start + 1)) {
             const candidate = this.sliceBalanced(rawText, start);
@@ -3333,8 +3631,20 @@ exports.extractInheritedVerdict = extractInheritedVerdict;
 exports.buildInitialStatusBody = buildInitialStatusBody;
 exports.findLatestStatusComment = findLatestStatusComment;
 const github_reviewer_1 = __nccwpck_require__(268);
-/** Invisible marker that identifies a comment as Robin's status comment (never the review). */
-exports.STATUS_COMMENT_MARKER = "<!-- robin:status -->";
+/**
+ * Invisible marker that identifies the one Robin comment on an issue.
+ *
+ * **现在等于 `REVIEW_MARKER`。** 曾经它是另一个字符串 `<!-- robin:status -->`，
+ * 于是状态评论和 review 各用各的标记，工作流失败重启后 PR 上会出现两条
+ * 「都是 Robin 的」评论。统一之后 find-then-create-or-update 只认一个身份，
+ * 三次运行也只留一条。
+ *
+ * 老名字保留是为了兼容：它现在是同一个值，`findLatestStatusComment` 也仍会
+ * 认领正文里带旧标记的历史评论，升级不会让存量 PR 突然多出一条。
+ */
+exports.STATUS_COMMENT_MARKER = github_reviewer_1.REVIEW_MARKER;
+/** Legacy marker written by older Robin versions; still adopted so upgrades don't double-post. */
+const LEGACY_STATUS_COMMENT_MARKER = "<!-- robin:status -->";
 /**
  * 失败状态评论的正文。
  *
@@ -3363,9 +3673,9 @@ function buildFailedStatusBody(reason, command) {
 }
 /** Prefix of the line that carries the previous run's verdict forward. */
 exports.LAST_RESULT_PREFIX = "> **Last result:** ";
-/** Append the invisible marker to a status body. Idempotent. */
+/** Prefix the marker to a status body. Idempotent; delegates to the shared marker helper. */
 function decorateStatusCommentBody(body) {
-    return body.includes(exports.STATUS_COMMENT_MARKER) ? body : `${body}\n\n${exports.STATUS_COMMENT_MARKER}`;
+    return (0, github_reviewer_1.decorateRobinCommentBody)(body);
 }
 /**
  * The most recent inherited verdict recorded in a status body, or undefined.
@@ -3400,10 +3710,19 @@ function buildInitialStatusBody(command, model, inheritedVerdict) {
 /**
  * The newest marked status comment on the issue, or undefined when there is none.
  *
+ * Delegates to the shared finder in `github-reviewer` so status comments and review
+ * comments resolve to *one* identity — that is what keeps a restarted run from
+ * growing a second comment. If that finds nothing, a second pass adopts a comment
+ * carrying the pre-unification `<!-- robin:status -->` marker, so a PR that was
+ * reviewed before the upgrade continues to inherit instead of starting fresh.
+ *
  * Best-effort: any API failure returns undefined so the caller falls back to creating a
  * comment instead of failing the run.
  */
 async function findLatestStatusComment(octokit, owner, repo, issueNumber) {
+    const current = await (0, github_reviewer_1.findExistingReviewComment)(octokit, owner, repo, issueNumber);
+    if (current)
+        return current;
     const client = octokit;
     const paginate = client?.paginate;
     const listComments = client?.rest?.issues?.listComments;
@@ -3424,7 +3743,13 @@ async function findLatestStatusComment(octokit, owner, repo, issueNumber) {
             const body = comment?.body;
             if (!Number.isFinite(id))
                 continue;
-            if (typeof body !== "string" || !body.includes(exports.STATUS_COMMENT_MARKER))
+            // 与 findExistingReviewComment 同一判据。作者这半边最容易漏：人类复制一段
+            // Robin 的旧评论（含 `<!-- robin:status -->`）再提问，就会被当成 Robin 自己的
+            // 评论认领并整条覆盖 —— 覆盖掉人写的话不可恢复。宁可漏认领（多一条评论），
+            // 也不能覆盖别人的字。
+            if (comment?.user?.login !== github_reviewer_1.ROBIN_BOT_LOGIN)
+                continue;
+            if (typeof body !== "string" || !body.includes(LEGACY_STATUS_COMMENT_MARKER))
                 continue;
             return { id, body };
         }

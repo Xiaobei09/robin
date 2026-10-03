@@ -16,10 +16,30 @@
  *    original verdict rather than re-inheriting its own copy.
  */
 
-import { ROBIN_SIGNATURE } from "./github-reviewer";
+import {
+  ROBIN_BOT_LOGIN,
+  ROBIN_SIGNATURE,
+  REVIEW_MARKER,
+  decorateRobinCommentBody,
+  findExistingReviewComment,
+} from "./github-reviewer";
 
-/** Invisible marker that identifies a comment as Robin's status comment (never the review). */
-export const STATUS_COMMENT_MARKER = "<!-- robin:status -->";
+/**
+ * Invisible marker that identifies the one Robin comment on an issue.
+ *
+ * **现在等于 `REVIEW_MARKER`。** 曾经它是另一个字符串 `<!-- robin:status -->`，
+ * 于是状态评论和 review 各用各的标记，工作流失败重启后 PR 上会出现两条
+ * 「都是 Robin 的」评论。统一之后 find-then-create-or-update 只认一个身份，
+ * 三次运行也只留一条。
+ *
+ * 老名字保留是为了兼容：它现在是同一个值，`findLatestStatusComment` 也仍会
+ * 认领正文里带旧标记的历史评论，升级不会让存量 PR 突然多出一条。
+ */
+export const STATUS_COMMENT_MARKER = REVIEW_MARKER;
+
+/** Legacy marker written by older Robin versions; still adopted so upgrades don't double-post. */
+const LEGACY_STATUS_COMMENT_MARKER = "<!-- robin:status -->";
+
 
 /**
  * 失败状态评论的正文。
@@ -54,9 +74,9 @@ export function buildFailedStatusBody(
 /** Prefix of the line that carries the previous run's verdict forward. */
 export const LAST_RESULT_PREFIX = "> **Last result:** ";
 
-/** Append the invisible marker to a status body. Idempotent. */
+/** Prefix the marker to a status body. Idempotent; delegates to the shared marker helper. */
 export function decorateStatusCommentBody(body: string): string {
-  return body.includes(STATUS_COMMENT_MARKER) ? body : `${body}\n\n${STATUS_COMMENT_MARKER}`;
+  return decorateRobinCommentBody(body);
 }
 
 /**
@@ -110,6 +130,12 @@ type StatusCommentLister = {
 /**
  * The newest marked status comment on the issue, or undefined when there is none.
  *
+ * Delegates to the shared finder in `github-reviewer` so status comments and review
+ * comments resolve to *one* identity — that is what keeps a restarted run from
+ * growing a second comment. If that finds nothing, a second pass adopts a comment
+ * carrying the pre-unification `<!-- robin:status -->` marker, so a PR that was
+ * reviewed before the upgrade continues to inherit instead of starting fresh.
+ *
  * Best-effort: any API failure returns undefined so the caller falls back to creating a
  * comment instead of failing the run.
  */
@@ -119,6 +145,9 @@ export async function findLatestStatusComment(
   repo: string,
   issueNumber: number
 ): Promise<AdoptableStatusComment | undefined> {
+  const current = await findExistingReviewComment(octokit, owner, repo, issueNumber);
+  if (current) return current;
+
   const client = octokit as {
     paginate?: StatusCommentLister["paginate"];
     rest?: { issues?: { listComments?: unknown } };
@@ -135,11 +164,16 @@ export async function findLatestStatusComment(
     });
     if (!Array.isArray(comments)) return undefined;
     for (let i = comments.length - 1; i >= 0; i--) {
-      const comment = comments[i];
+      const comment = comments[i] as { id?: unknown; body?: unknown; user?: { login?: unknown } | null };
       const id = Number(comment?.id);
       const body = comment?.body;
       if (!Number.isFinite(id)) continue;
-      if (typeof body !== "string" || !body.includes(STATUS_COMMENT_MARKER)) continue;
+      // 与 findExistingReviewComment 同一判据。作者这半边最容易漏：人类复制一段
+      // Robin 的旧评论（含 `<!-- robin:status -->`）再提问，就会被当成 Robin 自己的
+      // 评论认领并整条覆盖 —— 覆盖掉人写的话不可恢复。宁可漏认领（多一条评论），
+      // 也不能覆盖别人的字。
+      if (comment?.user?.login !== ROBIN_BOT_LOGIN) continue;
+      if (typeof body !== "string" || !body.includes(LEGACY_STATUS_COMMENT_MARKER)) continue;
       return { id, body };
     }
     return undefined;
@@ -147,3 +181,4 @@ export async function findLatestStatusComment(
     return undefined;
   }
 }
+

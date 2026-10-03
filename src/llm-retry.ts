@@ -11,10 +11,28 @@ export interface LlmRetryContext {
   model?: string;
 }
 
-/** OpenRouter routers (e.g. openrouter/free) pick models dynamically — no secret updates needed. */
-export function resolveLlmTimeoutMs(model: string | undefined, timeoutMs: number): number {
-  if (timeoutMs !== DEFAULT_LLM_TIMEOUT_MS) return timeoutMs;
-  return isOpenRouterRouterModel(model) ? DEFAULT_LLM_ROUTER_TIMEOUT_MS : timeoutMs;
+/**
+ * 把 LLM 请求超时解析成实际生效的毫秒数。
+ *
+ * **`timeoutMs` 必须能表达「未配置」。** 这里的判据是 `undefined` 而不是
+ * 「值恰好等于 `DEFAULT_LLM_TIMEOUT_MS`」—— 后者曾导致一个静默降级：
+ * 用户在 workflow 里**显式**写 `llm-timeout-ms: 600000`，与 action 自带的默认值
+ * 是同一个数，于是被判成「没配」，对 OpenRouter 路由模型悄悄改成 120000。
+ * 用户显式调高 timeout 通常正是因为推理模型慢，被打回 2 分钟必然超时。
+ *
+ * 为什么这个不对称是缺陷而不仅是巧合：同文件的 `getLlmCompletionAttemptCount`
+ * 也用 `=== DEFAULT` 做同样的判据，但方向是 3 → 5（**往上**，更保守），
+ * 混淆无害；这里是 600000 → 120000（**往下**），直接推翻用户的显式选择。
+ *
+ * 根因在 action.yml 那一层的 `default: "600000"`：默认值被提前填好，
+ * 「未配置」这一态根本到不了这里。`llm-max-attempts` 的 `default: ""` 正是
+ * 为此而设（描述里明写 "Leave empty to keep the built-in default"），
+ * 现在 `llm-timeout-ms` 补上同一套。
+ */
+export function resolveLlmTimeoutMs(model: string | undefined, timeoutMs?: number): number {
+  // 显式配置（哪怕恰好等于默认值）必须原样尊重。
+  if (typeof timeoutMs === "number" && Number.isFinite(timeoutMs)) return timeoutMs;
+  return isOpenRouterRouterModel(model) ? DEFAULT_LLM_ROUTER_TIMEOUT_MS : DEFAULT_LLM_TIMEOUT_MS;
 }
 
 export function isOpenRouterRouterModel(model: string | undefined): boolean {

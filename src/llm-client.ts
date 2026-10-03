@@ -3,7 +3,6 @@ import {
   DEFAULT_LLM_COMPLETION_ATTEMPTS,
   DEFAULT_LLM_ROUTER_FIRST_CHUNK_MS,
   DEFAULT_LLM_TEMPERATURE,
-  DEFAULT_LLM_TIMEOUT_MS,
 } from "./config";
 import {
   computeRetryDelayMs,
@@ -49,7 +48,11 @@ export class LLMClient {
     apiKey: string,
     model: string,
     maxOutputTokens?: number,
-    timeoutMs = DEFAULT_LLM_TIMEOUT_MS,
+    // 刻意**不给**默认值。给了就会把「未配置」变成 DEFAULT_LLM_TIMEOUT_MS，
+    // 于是 resolveLlmTimeoutMs 无法区分「没配」与「显式配了 600000」，
+    // 后者会被对 OpenRouter 路由模型静默降级成 120000ms。
+    // 传 undefined 一路传到 resolveLlmTimeoutMs，由它按模型选默认值。
+    timeoutMs?: number,
     maxAttempts = DEFAULT_LLM_COMPLETION_ATTEMPTS,
     temperature = DEFAULT_LLM_TEMPERATURE,
     onProgress?: LlmProgressHandler,

@@ -1,5 +1,5 @@
 import { shouldRetryStructuredReview } from "./review-retry";
-import { StructuredReview } from "./review-parser";
+import { ReviewParser, StructuredReview } from "./review-parser";
 
 function emptyReview(overrides: Partial<StructuredReview> = {}): StructuredReview {
   return {
@@ -55,5 +55,34 @@ describe("shouldRetryStructuredReview", () => {
         false
       )
     ).toBe(false);
+  });
+
+  /**
+   * 与 extractJsonObject 的围栏修复配对的断言。
+   *
+   * 这两个模块是一条因果链的两端，单独测任一个都会漏：
+   *   parseDetailed 因围栏遮蔽而 usedJson=false + findings 全空
+   *   → shouldRetryStructuredReview 看到 count===0 && !usedJson ⇒ 返回 true
+   *   → main.ts 重开 CI（审查结论丢失）
+   * 所以这里用**解析器的真实输出**当输入，而不是手搓一个假的 StructuredReview。
+   */
+  it("does not request a CI relaunch when a real finding was hidden behind a code fence", () => {
+    const rawText = [
+      "Here is the relevant code:",
+      "```ts",
+      "const a = { x: 1 };",
+      "```",
+      "And my review:",
+      '{"summary":"found a bug","high":[{"severity":"high","description":"real finding","file":"src/a.ts","line":3}]}',
+    ].join("\n");
+
+    const parsed = ReviewParser.parseDetailed(rawText);
+
+    // 前置条件：解析器必须真的把高危发现捞出来。
+    expect(parsed.usedJson).toBe(true);
+    expect(parsed.findings.high).toHaveLength(1);
+
+    // 因果链的后端：既然有发现，就绝不能要求重开 CI。
+    expect(shouldRetryStructuredReview(parsed.findings, parsed.usedJson)).toBe(false);
   });
 });

@@ -1,3 +1,4 @@
+import { ROBIN_BOT_LOGIN } from "./github-reviewer";
 import { readFileSync } from "fs";
 import * as path from "path";
 import {
@@ -27,13 +28,25 @@ function fakeOctokit(comments: unknown[], opts: { throwOnPaginate?: boolean } = 
 }
 
 describe("decorateStatusCommentBody", () => {
-  it("appends the invisible marker", () => {
-    expect(decorateStatusCommentBody("hello")).toBe(`hello\n\n${STATUS_COMMENT_MARKER}`);
+  it("prefixes the invisible marker", () => {
+    // 位置从「结尾」改成「开头」：GitHub 把正文渲染成 HTML 时会在 marker 与正文之间
+    // 插入 <p>，用 startsWith 认领就会失配。marker 必须在第一行。
+    expect(decorateStatusCommentBody("hello")).toBe(`${STATUS_COMMENT_MARKER}\nhello`);
   });
 
   it("is idempotent", () => {
     const once = decorateStatusCommentBody("hello");
     expect(decorateStatusCommentBody(once)).toBe(once);
+  });
+
+  it("does not double the marker when re-decorating a body that already starts with it", () => {
+    const decorated = decorateStatusCommentBody("## :eyes: On it");
+    expect(decorateStatusCommentBody(decorated).match(/<!-- robin-ai-review -->/g)).toHaveLength(1);
+  });
+
+  it("tolerates leading whitespace before an existing marker", () => {
+    const padded = "\n\n" + decorateStatusCommentBody("body");
+    expect(decorateStatusCommentBody(padded)).toBe(padded);
   });
 
   it("keeps the original text", () => {
@@ -106,6 +119,7 @@ describe("buildInitialStatusBody", () => {
 describe("findLatestStatusComment", () => {
   const marked = (id: number, extra = "") => ({
     id,
+    user: { login: ROBIN_BOT_LOGIN },
     body: `## :bow_and_arrow: Robin\n\n:eyes: On it\n${extra}\n${STATUS_COMMENT_MARKER}`,
   });
 
@@ -128,6 +142,58 @@ describe("findLatestStatusComment", () => {
       1
     );
     expect(found?.id).toBe(1);
+  });
+
+  /**
+   * 作者必须是 `github-actions[bot]`。半边条件（只认 marker 不认作者）会让一条
+   * 引用了 marker 的人类评论被当成 Robin 的来覆盖 —— 而覆盖掉人类写的话不可恢复。
+   */
+  it("never adopts a marked comment authored by a human", async () => {
+    const human = { id: 7, user: { login: "octocat" }, body: `${STATUS_COMMENT_MARKER}\nmy own notes` };
+    expect((await findLatestStatusComment(fakeOctokit([marked(1), human]), "o", "r", 1))?.id).toBe(1);
+    // 只有人类那条带 marker ⇒ 无可认领
+    expect(await findLatestStatusComment(fakeOctokit([human]), "o", "r", 1)).toBeUndefined();
+  });
+
+  /**
+   * 分页：marker 落在第 101 条之后也必须找得到。
+   * 只扫第一页就收工 ⇒ 判成「没有历史评论」⇒ 新建第二条 ⇒ 每次重启多一条，
+   * 而现象只是「评论多了一条」，不会有任何报错。
+   */
+  it("finds the marker past the 100-comment page boundary", async () => {
+    const many = Array.from({ length: 150 }, (_, i) => ({
+      id: i + 1,
+      user: { login: "octocat" },
+      body: `human chatter ${i}`,
+    }));
+    many.push(marked(999));
+    const octokit = fakeOctokit(many);
+    const found = await findLatestStatusComment(octokit, "o", "r", 1);
+    expect(found?.id).toBe(999);
+    // per_page 必须为 100，否则 GitHub 默认 30，永远跨不过页边界
+    expect(octokit.calls[0].params).toMatchObject({ per_page: 100 });
+  });
+
+  /** 升级兼容：老版本留下的 `<!-- robin:status -->` 评论仍要被认领，否则升级即多一条。 */
+  it("still adopts a comment carrying the pre-unification marker", async () => {
+    const legacy = { id: 42, user: { login: ROBIN_BOT_LOGIN }, body: "hi\n\n<!-- robin:status -->" };
+    expect((await findLatestStatusComment(fakeOctokit([legacy]), "o", "r", 1))?.id).toBe(42);
+  });
+
+  /**
+   * 老 marker 回退路径同样必须校验作者。
+   * 人类复制一段含 `<!-- robin:status -->` 的 Robin 旧评论来提问，是很自然的行为；
+   * 只查正文不查作者 ⇒ 那条提问被认领并整条覆盖 ⇒ 人的话不可恢复地消失。
+   */
+  it("never adopts a human comment that quotes the legacy marker", async () => {
+    const human = { id: 7, user: { login: "octocat" }, body: "why this error?\n<!-- robin:status -->" };
+    expect(await findLatestStatusComment(fakeOctokit([human]), "o", "r", 1)).toBeUndefined();
+  });
+
+  /** 新 marker 优先于老 marker：认领最新身份，老评论留给清理逻辑删。 */
+  it("prefers the unified marker over the legacy one", async () => {
+    const legacy = { id: 1, user: { login: ROBIN_BOT_LOGIN }, body: "old\n<!-- robin:status -->" };
+    expect((await findLatestStatusComment(fakeOctokit([legacy, marked(2)]), "o", "r", 1))?.id).toBe(2);
   });
 
   it("returns undefined when nothing is marked", async () => {
@@ -334,16 +400,34 @@ describe("失败评论的 Reason：绝不为空，也必须说清真正原因", 
       return wrapped || wrappedMultiline;
     };
 
-    it("新建状态评论（postStatusComment）的 body 值经过 decorateStatusCommentBody", () => {
+    it("新建状态评论（postStatusComment）把 body 交给统一发布器 publishRobinComment", () => {
       const seg = sliceOf("async function postStatusComment", "async function updateStatusComment");
-      expect(seg).toContain("createComment");
-      expect(bodyValueIsDecorated(seg)).toBe(true);
+      // 装饰不再发生在这个函数体里，而是收敛到 publishRobinComment 内（marker 单一来源）。
+      // 这里钉的是「走了统一发布器」这条接线，装饰本身由下面那条 publishRobinComment 守卫覆盖。
+      expect(seg).toContain("publishRobinComment");
+      expect(seg).toContain("buildInitialStatusBody");
     });
 
     it("更新状态评论（updateStatusComment）的 body 值经过 decorateStatusCommentBody", () => {
       const seg = sliceOf("async function updateStatusComment", "async function resolveStatusCommentId");
       expect(seg).toContain("updateComment");
       expect(bodyValueIsDecorated(seg)).toBe(true);
+    });
+
+    /**
+     * marker 的保证随写入点下沉到了 `publishRobinComment`，所以守卫也跟着搬过去。
+     *
+     * **为什么不能只把断言删掉。** `postStatusComment` 改成委托之后，原来那条
+     * 「body 的值就是装饰调用」的断言会红；如果只是把它改成「body 值经过装饰」
+     * 就放过，装饰被摘掉又会红；但若有人把整个委托改回裸 `createComment(body)`，
+     * 只断言 `publishRobinComment` 被调用是抓不到的。所以这里断言的是
+     * **这个函数体里 body 必须被装饰**，而不是「文件里出现过装饰这个词」。
+     * （与 M29 同一族：搜标识符 ≠ 钉住接线。）
+     */
+    it("委托出去的写入点仍把 body 交给 publishRobinComment 而非裸发", () => {
+      const seg = sliceOf("async function postStatusComment", "async function updateStatusComment");
+      // 不允许绕过统一发布器直接建评论：那正是「每次重启多一条」的来源
+      expect(seg).not.toContain("createComment");
     });
   });
 });

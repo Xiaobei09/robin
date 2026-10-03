@@ -1,4 +1,162 @@
-import { GitHubReviewer } from "./github-reviewer";
+import {
+  GitHubReviewer,
+  REVIEW_MARKER,
+  ROBIN_BOT_LOGIN,
+  decorateRobinCommentBody,
+  deletePreviousReviewComments,
+  findExistingReviewComment,
+  publishRobinComment,
+} from "./github-reviewer";
+
+/** Minimal stand-in for the octokit surface the comment helpers touch. */
+function fakeOctokit(comments: any[], opts: { throwOnPaginate?: boolean } = {}) {
+  const calls: Array<{ route: unknown; params: unknown }> = [];
+  const createComment = jest.fn().mockResolvedValue({ data: { id: 500 } });
+  const updateComment = jest.fn().mockResolvedValue({});
+  const deleteComment = jest.fn().mockResolvedValue({});
+  return {
+    calls,
+    createComment,
+    updateComment,
+    deleteComment,
+    rest: { issues: { listComments: {}, createComment, updateComment, deleteComment } },
+    paginate: async (route: unknown, params: unknown) => {
+      calls.push({ route, params });
+      if (opts.throwOnPaginate) throw new Error("boom");
+      return comments;
+    },
+  };
+}
+
+const marked = (id: number, login = ROBIN_BOT_LOGIN) => ({
+  id,
+  user: { login },
+  body: `${REVIEW_MARKER}\n## :bow_and_arrow: Robin`,
+});
+
+describe("decorateRobinCommentBody", () => {
+  it("puts the marker on the first line", () => {
+    expect(decorateRobinCommentBody("body")).toBe(`${REVIEW_MARKER}\nbody`);
+  });
+
+  it("does not double the marker", () => {
+    expect(decorateRobinCommentBody(decorateRobinCommentBody("x")).match(/<!-- robin-ai-review -->/g))
+      .toHaveLength(1);
+  });
+});
+
+describe("findExistingReviewComment", () => {
+  it("returns the newest marked bot comment", async () => {
+    expect((await findExistingReviewComment(fakeOctokit([marked(1), marked(2)]), "o", "r", 1))?.id).toBe(2);
+  });
+
+  it("requests per_page=100 so the marker is found past page 1", async () => {
+    const octokit = fakeOctokit([marked(1)]);
+    await findExistingReviewComment(octokit, "own", "rep", 42);
+    expect(octokit.calls[0].params).toEqual({
+      owner: "own",
+      repo: "rep",
+      issue_number: 42,
+      per_page: 100,
+    });
+  });
+
+  it("finds the marker beyond 100 comments", async () => {
+    const many = Array.from({ length: 150 }, (_, i) => ({ id: i + 1, user: { login: "octocat" }, body: "hi" }));
+    many.push(marked(999));
+    expect((await findExistingReviewComment(fakeOctokit(many), "o", "r", 1))?.id).toBe(999);
+  });
+
+  /** 覆盖人类评论不可恢复：只认 marker 不认作者 = 可能覆盖掉人写的话。 */
+  it("never adopts a human-authored marked comment", async () => {
+    expect(await findExistingReviewComment(fakeOctokit([marked(5, "octocat")]), "o", "r", 1)).toBeUndefined();
+  });
+
+  it("degrades to undefined instead of throwing", async () => {
+    expect(await findExistingReviewComment(fakeOctokit([], { throwOnPaginate: true }), "o", "r", 1))
+      .toBeUndefined();
+    expect(await findExistingReviewComment({}, "o", "r", 1)).toBeUndefined();
+    expect(await findExistingReviewComment(undefined, "o", "r", 1)).toBeUndefined();
+  });
+});
+
+describe("publishRobinComment", () => {
+  /** 首次运行：没有历史评论 ⇒ POST 新评论，body 带 marker。 */
+  it("creates a new marked comment when none exists", async () => {
+    const octokit = fakeOctokit([]);
+    const id = await publishRobinComment(octokit, "o", "r", 1, "hello");
+    expect(id).toBe(500);
+    expect(octokit.createComment).toHaveBeenCalledTimes(1);
+    expect(octokit.createComment.mock.calls[0][0].body).toBe(`${REVIEW_MARKER}\nhello`);
+    expect(octokit.updateComment).not.toHaveBeenCalled();
+  });
+
+  /** 重启场景：已有带 marker 的评论 ⇒ PATCH，绝不新建。PR 上永远只有一条。 */
+  it("updates the existing marked comment instead of creating a second one", async () => {
+    const octokit = fakeOctokit([marked(77)]);
+    const id = await publishRobinComment(octokit, "o", "r", 1, "second run");
+    expect(id).toBe(77);
+    expect(octokit.createComment).not.toHaveBeenCalled();
+    expect(octokit.updateComment).toHaveBeenCalledWith(
+      expect.objectContaining({ comment_id: 77, body: `${REVIEW_MARKER}\nsecond run` })
+    );
+  });
+
+  /** 三次运行 ⇒ 一条评论。这是整个重启需求的回归锁。 */
+  it("converges on one comment across three runs", async () => {
+    const store: any[] = [];
+    const octokit: any = {
+      rest: {
+        issues: {
+          listComments: {},
+          createComment: jest.fn(async (p: any) => {
+            const id = store.length + 1;
+            store.push({ id, user: { login: ROBIN_BOT_LOGIN }, body: p.body });
+            return { data: { id } };
+          }),
+          updateComment: jest.fn(async (p: any) => {
+            store.find((c) => c.id === p.comment_id).body = p.body;
+            return {};
+          }),
+        },
+      },
+      paginate: async () => store,
+    };
+    await publishRobinComment(octokit, "o", "r", 1, "run 1");
+    await publishRobinComment(octokit, "o", "r", 1, "run 2");
+    await publishRobinComment(octokit, "o", "r", 1, "run 3");
+    expect(store).toHaveLength(1);
+    expect(store[0].body).toBe(`${REVIEW_MARKER}\nrun 3`);
+  });
+
+  /** 评论已被删除（404）⇒ 不能把整轮跑挂掉，退回新建。 */
+  it("recreates when the existing comment can no longer be updated", async () => {
+    const octokit = fakeOctokit([marked(77)]);
+    octokit.updateComment.mockRejectedValue(new Error("Not Found"));
+    const id = await publishRobinComment(octokit, "o", "r", 1, "recovered");
+    expect(id).toBe(500);
+    expect(octokit.createComment).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("deletePreviousReviewComments", () => {
+  it("removes other bot comments and keeps the kept one", async () => {
+    const octokit = fakeOctokit([marked(1), marked(2), marked(3)]);
+    expect(await deletePreviousReviewComments(octokit, "o", "r", 1, 2)).toBe(2);
+    expect(octokit.deleteComment.mock.calls.map((c: any[]) => c[0].comment_id)).toEqual([1, 3]);
+  });
+
+  it("never deletes a human comment", async () => {
+    const octokit = fakeOctokit([marked(1, "octocat"), marked(2)]);
+    expect(await deletePreviousReviewComments(octokit, "o", "r", 1, 2)).toBe(0);
+    expect(octokit.deleteComment).not.toHaveBeenCalled();
+  });
+
+  it("is a no-op when listing fails", async () => {
+    const octokit = fakeOctokit([], { throwOnPaginate: true });
+    expect(await deletePreviousReviewComments(octokit, "o", "r", 1, 2)).toBe(0);
+  });
+});
 
 describe("GitHubReviewer", () => {
   it("resolves review event from high findings and request-changes mode", () => {

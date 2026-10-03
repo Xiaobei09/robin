@@ -41,9 +41,9 @@ inputs:
     required: false
     default: ""
   llm-timeout-ms:
-    description: "Timeout in milliseconds for LLM requests. Default is 10 minutes (600000 ms). Increase if you frequently see 'Request timed out' with large diffs."
+    description: "Timeout in milliseconds for LLM requests. Default is 10 minutes (600000 ms), or 2 minutes for OpenRouter router models. Increase if you frequently see 'Request timed out' with large diffs. Leave empty to keep the built-in default; note that setting it explicitly overrides the OpenRouter-specific timeout."
     required: false
-    default: "600000"
+    default: ""
   llm-max-attempts:
     description: "Maximum attempts per LLM completion request. Default is 3, and 5 for OpenRouter free-router models. Raise it when the provider intermittently drops connections or returns 5xx; set to 1 to disable retries. Leave empty to keep the built-in default."
     required: false

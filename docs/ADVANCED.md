@@ -116,10 +116,10 @@ Available on the [direct action](../action.yml) and the [reusable workflow](../.
 | `max-diff-size` | `50000` | Max diff characters sent to the model |
 | `max-output-tokens` | empty | Cap response tokens (optional) |
 | `reasoning-effort` | empty (defer to repo config) | Optional provider reasoning effort, provider-dependent (for example `low`, `medium`, `high`). Empty defers to `.github/robin.yml`; if that is also unset, no `reasoning` property is sent |
-| `llm-timeout-ms` | `600000` | LLM timeout (10 minutes) |
+| `llm-timeout-ms` | empty (defer to the action default) | LLM timeout. Empty keeps the built-in default of `600000` ms (10 minutes), or `120000` ms (2 minutes) for OpenRouter router models. Setting it explicitly also **overrides** the router-specific timeout — that is deliberate, so a slow reasoning model is never silently capped at 2 minutes |
 | `llm-max-attempts` | empty (defer to the action default) | Attempts per LLM completion request. Empty keeps the built-in default of 3 (5 for OpenRouter free-router models); raise it when the provider intermittently drops connections or returns 5xx, set `1` to disable retries. Values outside 1-10 are ignored with a warning |
 | `llm-relaunch-on-egress-failure` | `true` | When a **transient** LLM egress failure blocks the review, abandon this CI and start a fresh one — a new runner is a new egress path. Robin does it by posting a `/robin` comment, which the review workflow's `issue_comment` trigger turns into a new run; `concurrency` then cancels the old one. The previous round's verdict is carried over through the status comment. Permanent failures (wrong hostname, bad API key, missing model) are never relaunched — retrying cannot fix them. Set `false` to fail immediately instead. ⚠️ **This needs a `github-token` that can start workflows.** A PAT (`ghp_`/`github_pat_`) or GitHub App token works; the default `GITHUB_TOKEN` does **not** — events created with it never trigger a new workflow run (GitHub's anti-recursion rule; only `workflow_dispatch` and `repository_dispatch` are exempt). With `GITHUB_TOKEN` Robin logs a warning and fails rather than pretending a restart happened |
-| `llm-max-relaunches` | empty (defer to the action default) | How many times one review may be relaunched on a fresh CI. The action default is `2`; `0` disables relaunching. Hop count travels in the comment body, so it needs no external storage. Non-numeric input falls back to the default; negative values are treated as `0` (fail closed). The budget is scoped **per reviewed commit**: Robin records the PR head SHA alongside the hop, so pushing a new commit starts a fresh budget while an unchanged commit keeps exhausting it. Without that scoping one historic outage would permanently burn the budget for the whole PR |
+| `llm-max-relaunches` | empty (defer to the action default) | How many times one review may be relaunched on a fresh CI. The action default is `2`; `0` disables relaunching. Hop count travels in the comment body, so it needs no external storage. Non-numeric input falls back to the default; negative values are treated as `0` (fail closed). Values above `10` are clamped to `10` — this guard exists to stop a mistyped input from burning a maintainer's CI quota, so it needs a ceiling of its own. Only plain decimal notation is accepted: `1e1`, `0x2` and friends fall back to the default rather than being read as `10` and `2`. The budget is scoped **per reviewed commit**: Robin records the PR head SHA alongside the hop, so pushing a new commit starts a fresh budget while an unchanged commit keeps exhausting it. Without that scoping one historic outage would permanently burn the budget for the whole PR |
 | `llm-temperature` | `0.1` | Sampling temperature (0–2). Raise only if your model rejects the default — some models accept a single fixed value (Kimi requires `1`) |
 | `max-comments` | `15` | Max inline comments |
 | `review-on-synchronize` | `false` | Review every new commit on the PR |
@@ -235,7 +235,10 @@ jobs:
       LLM_MODEL: ${{ secrets.LLM_MODEL }}
 ```
 
-If you raise `llm-timeout-ms` above 10 minutes, also raise the job `timeout-minutes`.
+If you set `llm-timeout-ms` above 10 minutes, also raise the job `timeout-minutes`. Note that
+setting it explicitly also disables the shorter 2-minute cap that OpenRouter router models
+otherwise get — which is usually what you want when a slow reasoning model is timing out at
+2 minutes, but worth knowing if you were relying on that cap as a runaway guard.
 
 ### Models that require a fixed temperature
 

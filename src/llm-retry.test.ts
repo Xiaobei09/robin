@@ -19,6 +19,7 @@ import {
   DEFAULT_LLM_ROUTER_RETRY_DELAY_MS,
   DEFAULT_LLM_ROUTER_TIMEOUT_MS,
   DEFAULT_LLM_TIMEOUT_MS,
+  parseLLMTimeout,
 } from "./config";
 
 describe("openRouterStallError", () => {
@@ -29,16 +30,72 @@ describe("openRouterStallError", () => {
   });
 });
 
+/**
+ * R1072：判据必须是「有没有配」，不是「配的值是否等于默认值」。
+ *
+ * 旧实现用 `timeoutMs !== DEFAULT_LLM_TIMEOUT_MS` 代理「用户配过没有」，于是
+ * 用户**显式**写 `llm-timeout-ms: 600000`（与默认值同数）被判成没配，
+ * 对 OpenRouter 路由模型静默降级成 120000 —— 而用户显式调高 timeout 通常
+ * 正是因为推理模型慢，打回 2 分钟必然超时。
+ *
+ * 下面第一条断言**故意从旧的 600000 改成 undefined**：旧写法钉住的正是这个缺陷。
+ */
 describe("resolveLlmTimeoutMs", () => {
-  it("shortens the default timeout for OpenRouter routers", () => {
-    expect(resolveLlmTimeoutMs("openrouter/free", DEFAULT_LLM_TIMEOUT_MS)).toBe(
+  it("shortens the timeout for OpenRouter routers only when not configured", () => {
+    // 「未配置」用 undefined 表达，不再用「值恰好等于默认值」来代理。
+    expect(resolveLlmTimeoutMs("openrouter/free", undefined)).toBe(
       DEFAULT_LLM_ROUTER_TIMEOUT_MS
     );
-    expect(resolveLlmTimeoutMs("gpt-4o", DEFAULT_LLM_TIMEOUT_MS)).toBe(DEFAULT_LLM_TIMEOUT_MS);
+    expect(resolveLlmTimeoutMs("gpt-4o", undefined)).toBe(DEFAULT_LLM_TIMEOUT_MS);
+  });
+
+  it("honors an explicit value that happens to equal the default", () => {
+    // 这条是本次修复的核心：显式 600000 必须原样生效，不得被降级。
+    expect(resolveLlmTimeoutMs("openrouter/free", DEFAULT_LLM_TIMEOUT_MS)).toBe(
+      DEFAULT_LLM_TIMEOUT_MS
+    );
+    expect(resolveLlmTimeoutMs("openrouter/free", DEFAULT_LLM_TIMEOUT_MS)).not.toBe(
+      DEFAULT_LLM_ROUTER_TIMEOUT_MS
+    );
   });
 
   it("keeps an explicit consumer override", () => {
     expect(resolveLlmTimeoutMs("openrouter/free", 300000)).toBe(300000);
+    // 显式值也可以**高于**router 默认，把耐心调大同样必须被尊重。
+    expect(resolveLlmTimeoutMs("openrouter/free", 900000)).toBe(900000);
+  });
+
+  it("treats a non-finite explicit value as not configured rather than passing NaN through", () => {
+    // NaN 一旦传到 OpenAI 客户端的 timeout，SDK 行为不可预期；
+    // 退回按模型选默认值是唯一安全的解释。
+    expect(resolveLlmTimeoutMs("openrouter/free", Number.NaN)).toBe(
+      DEFAULT_LLM_ROUTER_TIMEOUT_MS
+    );
+    expect(resolveLlmTimeoutMs("gpt-4o", Number.NaN)).toBe(DEFAULT_LLM_TIMEOUT_MS);
+  });
+});
+
+/**
+ * 端到端接线：`parseLLMTimeout` → `resolveLlmTimeoutMs` 这一条链上，
+ * 显式配置必须一路无损地传到最终生效值。分开测两个函数都会漏掉「谁把
+ * 未配置塌成了默认值」这种接线错误。
+ */
+describe("R1072 接线：显式 timeout 端到端不被降级", () => {
+  const effective = (raw: string, model: string) =>
+    resolveLlmTimeoutMs(model, parseLLMTimeout(raw).value);
+
+  it("显式写 600000 时，OpenRouter 路由模型拿到 600000 而不是 120000", () => {
+    // 这是缺陷的完整复现路径：workflow 里写什么，最终就用什么。
+    expect(effective("600000", "openrouter/free")).toBe(600000);
+  });
+
+  it("留空时 OpenRouter 路由模型才拿到更短的 router 超时", () => {
+    expect(effective("", "openrouter/free")).toBe(DEFAULT_LLM_ROUTER_TIMEOUT_MS);
+  });
+
+  it("非路由模型两种情况都拿到 600000", () => {
+    expect(effective("", "gpt-4o")).toBe(DEFAULT_LLM_TIMEOUT_MS);
+    expect(effective("600000", "gpt-4o")).toBe(DEFAULT_LLM_TIMEOUT_MS);
   });
 });
 

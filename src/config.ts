@@ -32,21 +32,39 @@ export function parseStrictNumber(input: string): { value: number; valid: boolea
   return { value: parsed, valid: true };
 }
 
-export function parseLLMTimeout(input: string): { value: number; valid: boolean } {
-  if (!input) return { value: DEFAULT_LLM_TIMEOUT_MS, valid: true };
+/**
+ * 解析 `llm-timeout-ms`。
+ *
+ * **`undefined` 表示「未配置」，与任何具体数字都不同。** 这一层必须保留这个区分，
+ * 否则下游 `resolveLlmTimeoutMs` 只能拿「值是否等于 `DEFAULT_LLM_TIMEOUT_MS`」
+ * 去猜用户有没有配过 —— 而用户显式写 `600000`（与默认值同数）就会被误判成没配，
+ * 对 OpenRouter 路由模型静默降级成 120000ms，推理模型慢的 PR 必然超时。
+ *
+ * 与 `parseLLMMaxAttempts` 同一套制度（那边把「未配置」留给构造默认值 +
+ * OpenRouter 例外接手），也是 `action.yml` 里 `default: ""` 的原因。
+ */
+export function parseLLMTimeout(input: string): { value: number | undefined; valid: boolean } {
+  if (!input) return { value: undefined, valid: true };
   const { value: parsed, valid } = parseStrictNumber(input);
   if (valid && parsed > 0) {
     return { value: parsed, valid: true };
   }
-  return { value: DEFAULT_LLM_TIMEOUT_MS, valid: false };
+  return { value: undefined, valid: false };
 }
 
 export function parseLLMTemperature(input: string): { value: number; valid: boolean } {
   const trimmed = input.trim();
   if (!trimmed) return { value: DEFAULT_LLM_TEMPERATURE, valid: true };
-  const parsed = Number(trimmed);
+  // 走 parseStrictNumber，而不是裸 `Number()` —— 理由见该函数上方注释：
+  // `Number` 会照猜的读，把拼写错误变成一个合法但完全不同的数。
+  // 具体到温度，漏判的后果实测如下（都是 valid:true，日志一句警告都不会有）：
+  //   "0x2"    → 2   ← 十六进制字面量，静默把温度顶到 MAX_LLM_TEMPERATURE
+  //   "1e-400" → 0   ← 下溢成 0，与默认的 0.1 行为不同却看不出任何异常
+  //   "+1" / "1." → 1 ← 带符号 / 尾点写法同样被"猜"出来
+  // 温度直接决定采样多样性，静默落到上限 2 是最难察觉的一类配置漂移。
+  const { value: parsed, valid } = parseStrictNumber(input);
   // 0 is a legitimate value, so range-check instead of truthiness.
-  if (Number.isFinite(parsed) && parsed >= 0 && parsed <= MAX_LLM_TEMPERATURE) {
+  if (valid && parsed >= 0 && parsed <= MAX_LLM_TEMPERATURE) {
     return { value: parsed, valid: true };
   }
   return { value: DEFAULT_LLM_TEMPERATURE, valid: false };
@@ -72,9 +90,15 @@ export const MAX_LLM_COMPLETION_ATTEMPTS = 10;
 export function parseLLMMaxAttempts(input: string): { value: number | undefined; valid: boolean } {
   const trimmed = input.trim();
   if (!trimmed) return { value: undefined, valid: true };
-  const parsed = Number(trimmed);
+  // 同样走 parseStrictNumber。这一处的漏判后果比温度更实在：
+  //   "1e1" → 10   ← 科学计数法静默变成「上限 10 次尝试」，放大 10 倍的出口压力
+  //   "0x3" → 3    "0b11" → 3    "2e0" → 2
+  // 全部 valid:true，调用方（main.ts）只在 !valid 时告警 ⇒ 一声不吭地生效。
+  // 「未配置」与「拼错的配置」在这里代价特别不一样：拼错 ⇒ 反复打 provider。
+  const { value: parsed, valid } = parseStrictNumber(input);
   // Integer check: "2.5" attempts is meaningless, and Math.floor would hide a typo.
   if (
+    valid &&
     Number.isInteger(parsed) &&
     parsed >= MIN_LLM_COMPLETION_ATTEMPTS &&
     parsed <= MAX_LLM_COMPLETION_ATTEMPTS

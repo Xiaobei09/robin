@@ -180,6 +180,75 @@ describe("extractJsonObject：合法 JSON 不被散文里的花括号污染", ()
   });
 
   /**
+   * R1070：无关围栏**遮蔽**真 JSON。
+   *
+   * 旧实现只要看到 ``` 围栏就提前返回该块内容，配对扫描这层兜底一次都不执行。
+   * 模型在正文里贴代码片段是常态，于是：
+   *   ```ts  const a = { x: 1 };  ```   ← 围栏块，非 JSON
+   *   {"summary":…,"high":[…]}          ← 真正的 review JSON
+   * 提前返回 ⇒ JSON.parse 失败 ⇒ usedJson=false + findings 全空
+   * ⇒ main.ts 的 `count===0 && !usedJson` 命中 ⇒ 带真实高危发现的 PR 被白白重开 CI。
+   *
+   * 与上面「散文花括号污染合法 JSON」同一族、方向相反：那次污染，这次遮蔽。
+   */
+  describe("R1070：无关围栏不得遮蔽真 JSON", () => {
+    const review = {
+      summary: "Auth check is missing on one path.",
+      high: [{ severity: "high", description: "Unauthenticated path", file: "src/auth.ts", line: 12 }],
+    };
+    const reviewJson = JSON.stringify(review);
+
+    it("前置 ts 围栏（装代码片段）之后仍能取到真 review JSON", () => {
+      const raw = ["Here is the relevant code:", "```ts", "const a = { x: 1 };", "```", "And my review:", reviewJson].join("\n");
+      const parsed = ReviewParser.parseDetailed(raw);
+      expect(parsed.usedJson).toBe(true);
+      expect(parsed.findings.high).toHaveLength(1);
+      expect(parsed.findings.high[0].description).toBe("Unauthenticated path");
+      expect(parsed.findings.summary).toBe("Auth check is missing on one path.");
+    });
+
+    it("多个围栏块时取第一个真正是 JSON 的那个", () => {
+      const raw = [
+        "Setup:",
+        "```bash",
+        "npm install",
+        "```",
+        "Output:",
+        "```",
+        "added 3 packages",
+        "```",
+        "Review:",
+        "```json",
+        reviewJson,
+        "```",
+      ].join("\n");
+      const parsed = ReviewParser.parseDetailed(raw);
+      expect(parsed.usedJson).toBe(true);
+      expect(parsed.findings.high).toHaveLength(1);
+    });
+
+    it("```json 围栏里的合法 JSON 仍走优先路径（不得被后面的裸 JSON 抢走）", () => {
+      const fenced = JSON.stringify({ summary: "fenced wins", high: [] });
+      const parsed = ReviewParser.parseDetailed(["```json", fenced, "```"].join("\n"));
+      expect(parsed.usedJson).toBe(true);
+      expect(parsed.findings.summary).toBe("fenced wins");
+    });
+
+    it("只有一个非 JSON 围栏、且全文确实没有 JSON 时仍然 fail-closed", () => {
+      // 修复不能把 fail-closed 放松成「总能 parse 出点什么」。
+      const parsed = ReviewParser.parseDetailed(["```ts", "const a = { x: 1 };", "```"].join("\n"));
+      expect(parsed.usedJson).toBe(false);
+    });
+
+    it("非 JSON 围栏在**后**置时同样不遮蔽前面的真 JSON", () => {
+      const raw = [reviewJson, "```", "trailing log line", "```"].join("\n");
+      const parsed = ReviewParser.parseDetailed(raw);
+      expect(parsed.usedJson).toBe(true);
+      expect(parsed.findings.high).toHaveLength(1);
+    });
+  });
+
+  /**
    * 这一组钉的是「取最长」而不是「第一个能 parse 就用」的理由。
    *
    * 如果只取第一个，散文里的 `{"k": 1}` 会成为 review JSON：summary 取不到、

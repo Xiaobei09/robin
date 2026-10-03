@@ -12,6 +12,7 @@ import {
   resolveMaxRelaunches,
   resolveRelaunchOnEgressFailure,
   DEFAULT_MAX_RELAUNCHES,
+  MAX_RELAUNCHES,
 } from "./relaunch";
 import { AVAILABLE_COMMANDS, parseSlashCommand } from "./commands";
 
@@ -613,5 +614,87 @@ describe("重启评论的围栏击不穿（R945）", () => {
   it("普通错误文本原样保留（不啰嗦、不吞信息）", () => {
     const body = bodyWith("connect ETIMEDOUT 10.0.0.1:443");
     expect(body).toContain("connect ETIMEDOUT 10.0.0.1:443");
+  });
+});
+
+/**
+ * R1073：这道护栏自己必须有上界，且判定「什么算合法数字写法」只应有一处。
+ *
+ * 修之前 `resolveMaxRelaunches` 用裸 `Number()`：
+ *   "1e1" → 10   静默把上限抬到 5 倍默认
+ *   "1e3" → 1000 正是本文件开头明令禁止的「无限重启 CI」
+ *   "0b11" → 3   静默超过默认上限
+ * 并且**根本没有上界**（`MAX_RELAUNCHES` 是本轮新增的，之前不存在）。
+ * 全部 `valid` 外观、零告警 —— 维护者只会看到 CI 配额被烧光。
+ *
+ * 与 R1071 同一 bug 家族：那次修的是 `config.ts` 里的三个解析函数，
+ * 这里是**第四个**，住在另一个文件里，所以躲过了那次的一致性表。
+ * 教训：一致性表只覆盖了「同一个文件里的三个函数」，不等于「全仓只有一个判据」。
+ */
+describe("R1073：重启次数护栏有界，且不吃非十进制写法", () => {
+  it("非十进制写法一律回落到默认值，不得抬高上限", () => {
+    // 这几个在修之前全是「合法数字」，其中 1e3 是 1000 次重启。
+    for (const v of ["1e1", "1e2", "1e3", "2e1", "0x2", "0b11", "0x10"]) {
+      expect(resolveMaxRelaunches(v)).toBe(DEFAULT_MAX_RELAUNCHES);
+    }
+  });
+
+  it("任何输入都不得超过 MAX_RELAUNCHES", () => {
+    // 直接钉住「有界」这个性质本身，而不是逐个记结论 ——
+    // 以后有人再加一种解析写法，这条会立刻挡住。
+    for (const v of ["999", "100000", "1e9", "0x7fffffff", "9".repeat(40)]) {
+      expect(resolveMaxRelaunches(v)).toBeLessThanOrEqual(MAX_RELAUNCHES);
+    }
+    expect(MAX_RELAUNCHES).toBe(10);
+  });
+
+  it("超上限夹到上限，而不是退回默认值", () => {
+    // 夹而不是退回：保住调用方的意图（「我要多几次」）同时保证有界。
+    expect(resolveMaxRelaunches("20")).toBe(MAX_RELAUNCHES);
+    expect(resolveMaxRelaunches("11")).toBe(MAX_RELAUNCHES);
+    expect(resolveMaxRelaunches("10")).toBe(MAX_RELAUNCHES);
+  });
+
+  it("负数仍然 fail closed 到 0 —— 不得被严格解析改道到默认值", () => {
+    // 这条是本轮差点引入的回归：`parseStrictNumber` 按设计拒绝符号（连 "+1" 也不要），
+    // 于是 "-1" 会落到「无效 → 默认值」分支拿到 2 —— 恰好是这段注释最要防的方向：
+    // 「把 -1 悄悄当成允许重启 2 次会让这道护栏朝更松的方向失效」。
+    // 负号是有意义的语义，不是拼写错误，必须先于严格解析处理。
+    for (const v of ["-1", "-2", "-0", "- 3", "-1e1", "-999"]) {
+      expect(resolveMaxRelaunches(v)).toBe(0);
+    }
+  });
+
+  it("小数向下取整（既有行为不变），不放宽护栏", () => {
+    // 既有测试已钉 2.9 → 2。向下取整是保守方向：不超过调用方要求的次数。
+    // 修之前那段注释写「小数夹到 0」与代码不符 —— 改的是注释，不是被测试的行为。
+    expect(resolveMaxRelaunches("2.9")).toBe(2);
+    expect(resolveMaxRelaunches("0.5")).toBe(0);
+    expect(resolveMaxRelaunches("2.5")).toBe(2);
+  });
+
+  it("合法写法与未配置路径不受影响", () => {
+    expect(resolveMaxRelaunches("5")).toBe(5);
+    expect(resolveMaxRelaunches(" 3 ")).toBe(3);
+    expect(resolveMaxRelaunches("0")).toBe(0);
+    expect(resolveMaxRelaunches(undefined)).toBe(DEFAULT_MAX_RELAUNCHES);
+    expect(resolveMaxRelaunches("")).toBe(DEFAULT_MAX_RELAUNCHES);
+    expect(resolveMaxRelaunches("abc")).toBe(DEFAULT_MAX_RELAUNCHES);
+  });
+
+  it("全仓只应有一处判定「什么算合法数字写法」", () => {
+    // 行为测试是主防线；这条钉住「不要在别的文件里再写一份裸 Number()」。
+    // R1071 的一致性表覆盖了 config.ts 内部，却漏了 relaunch.ts ——
+    // 所以这里把范围扩大到源码扫描。
+    const src = readFileSync(join(__dirname, "relaunch.ts"), "utf8");
+    const start = src.indexOf("export function resolveMaxRelaunches(");
+    expect(start).toBeGreaterThan(-1);
+    const body = src.slice(start, src.indexOf("\n}", start));
+    expect(body).toContain("parseStrictNumber");
+    // `\b` 是必需的：`parseStrictNumber(trimmed)` 里含有子串 `Number(trimmed)`，
+    // 而 `t` 与 `N` 都是词字符 ⇒ 没有词边界 ⇒ 不加 `\b` 会把「已经改用共享判据」
+    // 的正确代码也判成违规。这条测试自己先抓到了这个误报。
+    expect(body).not.toMatch(/\bNumber\(\s*trimmed\s*\)/);
+    expect(body).not.toMatch(/\bNumber\(\s*String\(\s*raw/);
   });
 });

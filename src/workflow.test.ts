@@ -23,6 +23,29 @@ const readme = readFileSync(join(repoRoot, "README.md"), "utf8");
 const advancedDocs = readFileSync(join(repoRoot, "docs", "ADVANCED.md"), "utf8");
 const actionYml = readFileSync(join(repoRoot, "action.yml"), "utf8");
 
+/**
+ * 取 YAML 里某个 input 的 default（带引号原样返回）。缩进自适应。
+ *
+ * 提升到模块作用域：R1072 的「三层都留空」不变式也要用它，而拷贝第二份
+ * 正是本文件与 review.yml 里反复出现的那类漂移的源头。
+ */
+function inputDefault(source: string, name: string): string | undefined {
+  const key = new RegExp(`^([ \\t]+)${name}:[ \\t]*$`, "m").exec(source);
+  if (!key) return undefined;
+  const indent = key[1].length;
+  const rest = source.slice(key.index + key[0].length);
+  let block = "";
+  for (const line of rest.split("\n")) {
+    if (line.trim() === "") {
+      block += "\n";
+      continue;
+    }
+    if ((line.match(/^[ \t]*/) as RegExpMatchArray)[0].length <= indent) break;
+    block += `${line}\n`;
+  }
+  return block.match(/^[ \t]+default:[ \t]*"?([^"\n]*)"?[ \t]*$/m)?.[1];
+}
+
 /** Inputs that are secrets / token on the action, not workflow_call inputs. */
 const ACTION_ONLY_SECRETS = new Set([
   "github-token",
@@ -349,24 +372,6 @@ describe("「未设置」哨兵：五份副本必须逐字相等（R946）", () 
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/^[ \t]*\/\/.*$/gm, "");
 
-  /** 取 YAML 里某个 input 的 default（带引号原样返回）。缩进自适应。 */
-  function inputDefault(source: string, name: string): string | undefined {
-    const key = new RegExp(`^([ \\t]+)${name}:[ \\t]*$`, "m").exec(source);
-    if (!key) return undefined;
-    const indent = key[1].length;
-    const rest = source.slice(key.index + key[0].length);
-    let block = "";
-    for (const line of rest.split("\n")) {
-      if (line.trim() === "") {
-        block += "\n";
-        continue;
-      }
-      if ((line.match(/^[ \t]*/) as RegExpMatchArray)[0].length <= indent) break;
-      block += `${line}\n`;
-    }
-    return block.match(/^[ \t]+default:[ \t]*"?([^"\n]*)"?[ \t]*$/m)?.[1];
-  }
-
   /** 取 main.ts 里 `core.getInput("x") || <兜底>` 的兜底表达式原文。 */
   function mainFallback(name: string): string {
     const m = new RegExp(`core\\.getInput\\("${name}"\\)\\s*\\|\\|\\s*(.+?);`).exec(mainCode);
@@ -439,5 +444,51 @@ describe("「未设置」哨兵：五份副本必须逐字相等（R946）", () 
         m[1] === "max-comments" ? String(DEFAULT_MAX_COMMENTS) : String(DEFAULT_ACTION_MAX_DIFF_SIZE);
       expect({ knob: m[1], documented: m[2] }).toEqual({ knob: m[1], documented: expected });
     }
+  });
+});
+
+/**
+ * R1072：`llm-timeout-ms` 的「未配置」必须在**三层**都保持为空。
+ *
+ * 这与上面 R946 的「五份副本逐字相等」是同一族失效，但**哨兵形态相反**，所以
+ * R946 那套「某处必须等于某个常量」的写法在这里用不上 —— 要钉的不是「某个数字
+ * 一致」，而是「所有层都不得把数字填进去」。
+ *
+ * 失效形态特别安静：任何一层提前填上默认值，`parseLLMTimeout` 就再也区分不出
+ * 「调用方没配」与「调用方显式配成了这个值」，于是 `resolveLlmTimeoutMs` 只能
+ * 靠「值是否等于默认值」去猜 —— 用户显式写 `600000` 就会被判成没配，对
+ * OpenRouter 路由模型静默降级成 120000ms。日志里没有任何异常。
+ *
+ * 三层缺一不可，R1072 修的就是这件事：`action.yml` 与 `review.yml` 都填了
+ * `"600000"`，只改其中一层并不能修好（另一层照样把值喂进来）。
+ */
+describe("「未配置」必须三层都留空：llm-timeout-ms（R1072）", () => {
+  it("action.yml 的 llm-timeout-ms 不填默认值", () => {
+    expect(inputDefault(actionYml, "llm-timeout-ms")).toBe("");
+  });
+
+  it("review.yml 的 llm-timeout-ms 不填默认值", () => {
+    // 这一层最容易漏：复用工作流原样转发 inputs.llm-timeout-ms，
+    // 只改 action.yml 的话这里照样把 "600000" 喂下去，等于没修。
+    expect(inputDefault(reviewWorkflow, "llm-timeout-ms")).toBe("");
+  });
+
+  it("main.ts 不得用字面量兜底（未配置要能一路传到解析层）", () => {
+    const mainSrc = readFileSync(join(repoRoot, "src", "main.ts"), "utf8");
+    const mainCode = mainSrc
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^[ \t]*\/\/.*$/gm, "");
+    // 必须是 `|| ""`：空串是「未配置」在 main.ts 的表示形式。
+    // 若写成 `|| "600000"`，「未配置」这一态在进解析层前就已被填死。
+    const m = /core\.getInput\("llm-timeout-ms"\)\s*\|\|\s*(""|"[^"]*")/.exec(mainCode);
+    expect(m).not.toBeNull();
+    expect((m as RegExpMatchArray)[1]).toBe('""');
+  });
+
+  it("llm-max-attempts 是同一套制度的既有正确样本，三层同样留空", () => {
+    // 防「为了修一个输入而把另一个改坏」，也钉住这套制度确实是仓库的既定模式，
+    // 而不是本轮新发明的规则。
+    expect(inputDefault(actionYml, "llm-max-attempts")).toBe("");
+    expect(inputDefault(reviewWorkflow, "llm-max-attempts")).toBe("");
   });
 });

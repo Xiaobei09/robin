@@ -107,9 +107,44 @@ export class ReviewParser {
    * 复杂度最坏 O(n²)（每个 `{` 一次扫描），但输出长度受 `max-output-tokens` 约束，
    * 实测量级在毫秒，不需要为此再加魔数上限（那会引入新的可动变量）。
    */
+  /**
+   * 先试所有围栏块，再退到配对扫描，两条路都不中才返回 null。
+   *
+   * **为什么围栏块不能提前返回。** 旧实现只要看到 ``` 围栏就把块内容原样返回，
+   * 于是配对扫描这层兜底**一次都不会执行**。而模型很爱在正文里贴代码片段：
+   *
+   *   Here is the relevant code:
+   *   ```ts
+   *   const a = { x: 1 };
+   *   ```
+   *   And my review:
+   *   {"summary":"found a bug","high":[…]}
+   *
+   * 这时围栏块装的是 `ts\nconst a = { x: 1 };`，不是 review JSON。提前返回 ⇒
+   * `parseJsonReview` 的 `JSON.parse` 失败 ⇒ 返回 null ⇒ `usedJson=false`、
+   * findings 全空。而 `main.ts` 的重开判定是 `count === 0 && !usedJson`
+   * ⇒ 一个**带着真实高危发现**的 PR 被判成「模型没给出 JSON」，白白重开 CI，
+   * 审查结论直接丢失。
+   *
+   * 这与 R927 同一族、方向相反：那次是散文里的 `{...}` 污染了**合法** JSON；
+   * 这次是无关围栏**遮蔽**了真 JSON。两次都是「取 JSON」这一步的旁路先炸。
+   *
+   * 围栏块现在只是**候选之一**：逐个试 `JSON.parse`，不中就继续看下一个，
+   * 全不中再走配对扫描。真正的 review JSON 通常在 ```json 块里，这条优先路径保留。
+   */
   private static extractJsonObject(rawText: string): string | null {
-    const fencedJson = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-    if (fencedJson) return fencedJson[1].trim();
+    const fencePattern = /```(?:json)?\s*([\s\S]*?)\s*```/gi;
+    let match: RegExpExecArray | null;
+    while ((match = fencePattern.exec(rawText)) !== null) {
+      const candidate = match[1].trim();
+      if (!candidate) continue;
+      try {
+        JSON.parse(candidate);
+      } catch {
+        continue;
+      }
+      return candidate;
+    }
 
     let best: string | null = null;
     for (

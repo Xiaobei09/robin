@@ -23,6 +23,7 @@
  */
 
 import { errorMessage, isTransientEgressFailure } from "./llm-retry";
+import { parseStrictNumber } from "./config";
 
 /** 触发新 CI 的命令前缀。必须是整个正文的开头，见上方约束 1。 */
 export const RELAUNCH_COMMAND = "/robin";
@@ -45,17 +46,45 @@ export interface RelaunchDecision {
   hop?: number;
 }
 
+/**
+ * 重启次数的硬上限。
+ *
+ * 这道护栏的作用就是「别让出口故障把维护者的 CI 配额烧光」，所以它自己必须有上界。
+ * 修之前**根本没有上界**：`Number("1e3")` 是 1000，于是 `llm-max-relaunches: 1e3`
+ * 会让同一次审查重启 1000 次 —— 正是本文件开头明令禁止的「无限重启 CI」。
+ * 值取得和 `MAX_LLM_COMPLETION_ATTEMPTS`（同为 10）一致：默认的 5 倍，足够宽裕，
+ * 又足以挡住笔误与脚本生成的怪值。
+ */
+export const MAX_RELAUNCHES = 10;
+
 export function resolveMaxRelaunches(raw: string | undefined | null): number {
   if (raw === undefined || raw === null || String(raw).trim() === "") {
     return DEFAULT_MAX_RELAUNCHES;
   }
-  const parsed = Number(String(raw).trim());
-  // 非数字（用户笔误）：用文档化默认值，从宽。
-  if (!Number.isFinite(parsed)) return DEFAULT_MAX_RELAUNCHES;
-  // 数字但越界（负数/小数）：**夹到 0**，也就是彻底关掉重启。
-  // 这里必须 fail closed 而不是 fail open —— 把 "-1" 悄悄当成"允许重启 2 次"
-  // 会让这道护栏朝更松的方向失效，正是它本该防住的事故。
-  return Math.max(0, Math.floor(parsed));
+  const trimmed = String(raw).trim();
+  // 负数：夹到 0，也就是彻底关掉重启。这里必须 fail closed 而不是 fail open ——
+  // 把 "-1" 悄悄当成"允许重启 2 次"会让这道护栏朝更松的方向失效，
+  // 正是它本该防住的事故。
+  //
+  // 必须**先于** parseStrictNumber 处理：`parseStrictNumber` 按设计只接受纯十进制
+  // 写法（连 `+1` / `1.` 都拒，见 config.ts），所以 `-1` 会落到下面的"无效"分支
+  // 拿到默认值 2 —— 恰好是本段最要防的那个方向。负号是有意义的语义，不是拼写错误。
+  if (trimmed.startsWith("-")) return 0;
+  // 走 parseStrictNumber 而不是裸 `Number()`：后者会把十六进制/二进制/科学计数法
+  // 「照猜的读」成一个合法数字。实测 `1e1` → 10（静默把上限抬到 5 倍）、
+  // `0b11` → 3、`1e3` → 1000，全部外观合法、零告警。
+  // 判定「什么算合法数字写法」只应有一处（config.ts 的 parseStrictNumber），
+  // 各文件自己写 `Number()` 就是这种漂移的来源。
+  const { value: parsed, valid } = parseStrictNumber(trimmed);
+  // 非数字**以及**非十进制写法（都是用户笔误）：用文档化默认值，从宽。
+  // 这里从宽是安全的 —— 默认值 2 本身有界，而把 `1e3` 当成合法才是危险的。
+  if (!valid) return DEFAULT_MAX_RELAUNCHES;
+  // 小数（如 "2.9" 次重启）没有意义。向下取整是**保守**方向：不会超过调用方
+  // 要求的次数，2.9 次本就该读作 2 次。（不要改成夹到 0 —— 既有测试钉的是
+  // `2.9 → 2`，且从宽的这一侧并不放松护栏。原先此处"小数夹到 0"的注释与代码不符。）
+  const whole = Math.floor(parsed);
+  // 超上限：夹到上限而不是退回默认值 —— 既保住调用方的意图，又保证有界。
+  return Math.min(whole, MAX_RELAUNCHES);
 }
 
 export function resolveRelaunchOnEgressFailure(

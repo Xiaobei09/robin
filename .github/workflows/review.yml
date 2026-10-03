@@ -35,10 +35,10 @@ on:
         type: string
         default: ""
       llm-timeout-ms:
-        description: "LLM request timeout in milliseconds."
+        description: "LLM request timeout in milliseconds. Empty keeps the action default (10 min, or 2 min for OpenRouter router models). Setting it explicitly also overrides the router-specific timeout."
         required: false
         type: string
-        default: "600000"
+        default: ""
       llm-max-attempts:
         description: "Attempts per LLM completion request (empty keeps the action default)."
         required: false
