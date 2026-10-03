@@ -184,8 +184,16 @@ export function resolveMaxDiffSize(
  * 否则用户会拿到一个自己没要求过的值而毫无察觉」）。
  *
  * 空串是**正常的"未设置"**，不是错误 ⇒ `valid: true`，不该告警。
+ *
+ * **导出**（R1086）：`main.ts` 里 `fail-on-high` 原本是裸的
+ * `core.getInput("fail-on-high") === "true"`。`action.yml` 没给它写 `type:`，
+ * 于是按 GitHub 的规则它是 `string` ⇒ **不做归一化、原样透传**；而
+ * `review.yml` 里它是 `type: boolean` ⇒ 归一化后才转发。
+ * 同一份代码对两条入口的行为因此不一致，而它决定的是**要不要把 CI 标红** ——
+ * 直接 action 用法（AGENTS.md 明确文档化）写 `fail-on-high: True` 会静默失效。
+ * 与其复制第三份归一化逻辑，不如复用这一个。
  */
-function resolveBooleanInput(
+export function resolveBooleanInput(
   actionInput: string,
   repoValue: boolean | undefined,
   fallback: boolean,

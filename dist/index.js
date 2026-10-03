@@ -1831,7 +1831,18 @@ async function run() {
         const baseUrl = core.getInput("llm-base-url") || "";
         const model = core.getInput("model") || "";
         llmModel = model;
-        const failOnHigh = core.getInput("fail-on-high") === "true";
+        // `fail-on-high` 曾是裸的 `core.getInput(...) === "true"`（R1086）。
+        // 危险不在解析方式，而在**两条入口的类型声明不一致**：`action.yml` 没写 `type:`
+        // ⇒ 按 GitHub 规则是 string、**不归一化、原样透传**；`review.yml` 是 `type: boolean`
+        // ⇒ 归一化后才转发。于是直接 action 用法（AGENTS.md 明确文档化）写
+        // `fail-on-high: True` 会静默拿到 false —— **门禁静默失效，高危发现也不标红**，
+        // 且它没有 .github/robin.yml 兜底（不像 max-comments），识别不了就什么都没有。
+        // 复用 repo-config 的归一化助手，不在这里写第三份逻辑。
+        const failOnHighInput = core.getInput("fail-on-high");
+        const { value: failOnHigh, valid: failOnHighValid } = (0, repo_config_1.resolveBooleanInput)(failOnHighInput, undefined, false);
+        if (!failOnHighValid) {
+            core.warning(`Invalid fail-on-high value "${failOnHighInput}"; expected "true" or "false". Using false.`);
+        }
         // 这两个兜底值是**哨兵**，不是「随便一个默认值」：resolveMaxComments /
         // resolveMaxDiffSize 靠「解析结果是否等于默认常量」来判断调用方是否真的没传，
         // 只有这时才让 .github/robin.yml 赢（review.yml 里那句 "omitted must stay
@@ -2964,6 +2975,7 @@ exports.DEFAULT_MAX_COMMENTS = exports.DEFAULT_ACTION_MAX_DIFF_SIZE = exports.DE
 exports.parseRepoConfigYaml = parseRepoConfigYaml;
 exports.resolveMaxComments = resolveMaxComments;
 exports.resolveMaxDiffSize = resolveMaxDiffSize;
+exports.resolveBooleanInput = resolveBooleanInput;
 exports.resolveJsonResponseMode = resolveJsonResponseMode;
 exports.resolveRequestChanges = resolveRequestChanges;
 exports.resolveReasoningEffort = resolveReasoningEffort;
@@ -3123,6 +3135,14 @@ function resolveMaxDiffSize(actionInput, repoConfig) {
  * 否则用户会拿到一个自己没要求过的值而毫无察觉」）。
  *
  * 空串是**正常的"未设置"**，不是错误 ⇒ `valid: true`，不该告警。
+ *
+ * **导出**（R1086）：`main.ts` 里 `fail-on-high` 原本是裸的
+ * `core.getInput("fail-on-high") === "true"`。`action.yml` 没给它写 `type:`，
+ * 于是按 GitHub 的规则它是 `string` ⇒ **不做归一化、原样透传**；而
+ * `review.yml` 里它是 `type: boolean` ⇒ 归一化后才转发。
+ * 同一份代码对两条入口的行为因此不一致，而它决定的是**要不要把 CI 标红** ——
+ * 直接 action 用法（AGENTS.md 明确文档化）写 `fail-on-high: True` 会静默失效。
+ * 与其复制第三份归一化逻辑，不如复用这一个。
  */
 function resolveBooleanInput(actionInput, repoValue, fallback) {
     const normalized = actionInput.trim().toLowerCase();

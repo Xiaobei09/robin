@@ -2,6 +2,7 @@ import {
   DEFAULT_MAX_COMMENTS,
   DEFAULT_ACTION_MAX_DIFF_SIZE,
   parseRepoConfigYaml,
+  resolveBooleanInput,
   resolveJsonResponseMode,
   resolveMaxComments,
   resolveMaxDiffSize,
@@ -209,6 +210,7 @@ describe("main.ts 真的会用 valid 告警（源码扫描，R1085）", () => {
     for (const [flag, inputName] of [
       ["!jsonResponseModeValid", "jsonResponseModeInput"],
       ["!requestChangesValid", "requestChangesInput"],
+      ["!failOnHighValid", "failOnHighInput"],
     ] as const) {
       const seg = warnsAfter(flag);
       expect(seg.length).toBeGreaterThan(0); // 锚点必须真的存在，否则下面全是空断言
@@ -216,6 +218,58 @@ describe("main.ts 真的会用 valid 告警（源码扫描，R1085）", () => {
       // 告警必须带上用户实际写的那串，否则等于没告警
       expect(seg).toContain(inputName);
     }
+  });
+
+  /**
+   * `fail-on-high` 的原始写法是裸的 `core.getInput(...) === "true"`，**没有告警**。
+   * 这里钉住它已经改走归一化助手 —— 否则 R1086 的修复可以被无声退回，
+   * 而所有现有测试仍全绿（它们测的是助手本身，不是 main.ts 有没有用它）。
+   */
+  it("fail-on-high 已改走归一化助手，不再是裸的 === \"true\"", () => {
+    expect(src).not.toMatch(/getInput\("fail-on-high"\)\s*===\s*"true"/);
+    expect(src).toMatch(/resolveBooleanInput\(\s*failOnHighInput,\s*undefined,\s*false,?\s*\)/);
+  });
+});
+
+/**
+ * R1086：`fail-on-high` 的兜底是 `false`（不是 true），且**没有** repo config 兜底。
+ * 这两条容易被上面那组 `?? true` 的测试掩盖，所以单独钉。
+ *
+ * 背景：`action.yml` 没给 `fail-on-high` 写 `type:` ⇒ 它是 `string` ⇒ GitHub
+ * **不归一化**；`review.yml` 是 `type: boolean` ⇒ 归一化后才转发。同一份代码对两条
+ * 入口行为不一致，而它决定**要不要把 CI 标红**。
+ */
+describe("resolveBooleanInput：fail-on-high 的形状（R1086）", () => {
+  const failOnHigh = (input: string) => resolveBooleanInput(input, undefined, false);
+
+  it("空串（未设置）⇒ false 且不算错，与原先 `=== \"true\"` 的结果一致", () => {
+    // 原先 `core.getInput("fail-on-high") === "true"`：空串 ⇒ false。
+    // 这里必须保持一致，否则「没设置」会突然变成 true、把 CI 全部标红。
+    expect(failOnHigh("")).toEqual({ value: false, valid: true });
+  });
+
+  it("直接 action 用法下的常见拼写不再静默丢掉门禁", () => {
+    // AGENTS.md 明确文档化了直接 action 用法，那条路径没有 GitHub 的归一化。
+    for (const s of ["True", "TRUE", " true", "true "]) {
+      expect(failOnHigh(s)).toEqual({ value: true, valid: true });
+    }
+    for (const s of ["False", "FALSE", "false "]) {
+      expect(failOnHigh(s)).toEqual({ value: false, valid: true });
+    }
+  });
+
+  it("识别不了的拼写 valid=false —— 门禁静默失效必须留下痕迹", () => {
+    for (const s of ["yes", "no", "1", "0", "enabled"]) {
+      expect(failOnHigh(s)).toEqual({ value: false, valid: false });
+    }
+  });
+
+  it("repoValue 为 undefined 时严格取 fallback，不靠真值判断", () => {
+    // fallback 可能是 false，所以不能用 `repoValue || fallback`（false || x !== false）。
+    expect(resolveBooleanInput("", undefined, false).value).toBe(false);
+    expect(resolveBooleanInput("", undefined, true).value).toBe(true);
+    expect(resolveBooleanInput("", false, true).value).toBe(false);
+    expect(resolveBooleanInput("", true, false).value).toBe(true);
   });
 });
 
