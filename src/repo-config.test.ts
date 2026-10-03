@@ -8,6 +8,8 @@ import {
   resolveReasoningEffort,
   resolveRequestChanges,
 } from "./repo-config";
+import { readFileSync } from "fs";
+import { join } from "path";
 
 describe("parseRepoConfigYaml", () => {
   it("parses supported keys", () => {
@@ -104,19 +106,116 @@ describe("resolveMaxComments", () => {
 
 describe("resolveJsonResponseMode", () => {
   it("prefers explicit action input, then repo config, then default true", () => {
-    expect(resolveJsonResponseMode("false", { jsonResponseMode: true })).toBe(false);
-    expect(resolveJsonResponseMode("true", { jsonResponseMode: false })).toBe(true);
-    expect(resolveJsonResponseMode("", { jsonResponseMode: false })).toBe(false);
-    expect(resolveJsonResponseMode("", undefined)).toBe(true);
+    expect(resolveJsonResponseMode("false", { jsonResponseMode: true }).value).toBe(false);
+    expect(resolveJsonResponseMode("true", { jsonResponseMode: false }).value).toBe(true);
+    expect(resolveJsonResponseMode("", { jsonResponseMode: false }).value).toBe(false);
+    expect(resolveJsonResponseMode("", undefined).value).toBe(true);
   });
 });
 
 describe("resolveRequestChanges", () => {
   it("prefers explicit action input, then repo config, then default true", () => {
-    expect(resolveRequestChanges("false", { requestChanges: true })).toBe(false);
-    expect(resolveRequestChanges("true", { requestChanges: false })).toBe(true);
-    expect(resolveRequestChanges("", { requestChanges: false })).toBe(false);
-    expect(resolveRequestChanges("", undefined)).toBe(true);
+    expect(resolveRequestChanges("false", { requestChanges: true }).value).toBe(false);
+    expect(resolveRequestChanges("true", { requestChanges: false }).value).toBe(true);
+    expect(resolveRequestChanges("", { requestChanges: false }).value).toBe(false);
+    expect(resolveRequestChanges("", undefined).value).toBe(true);
+  });
+});
+
+/**
+ * R1085：两个解析器改为返回 `{value, valid}` —— 与同文件 `resolveMaxComments` /
+ * `resolveMaxDiffSize` 同一套契约，让调用方**能告警**。
+ *
+ * 修的是什么：`use-json-response-mode` 在 `review.yml` 里是 `type: string`，
+ * GitHub 不做任何归一化，原样透传；而解析器原先用精确比较 `=== "true"`。
+ * 于是 `False` / `FALSE` / `" false"` 全部落空，**静默退回默认 true** ——
+ * 用户明确写了要关，实际没关，且日志里一个字都没有。
+ */
+describe("布尔输入：归一化 + valid 契约（R1085）", () => {
+  const spellingsThatMeanOff = ["false", "False", "FALSE", " false", "false ", "\tfalse"];
+  const spellingsThatMeanOn = ["true", "True", "TRUE", " true", "true "];
+
+  it("大小写与前后空白不再让「关」失效（原先只认精确的 \"false\"）", () => {
+    for (const s of spellingsThatMeanOff) {
+      expect(resolveJsonResponseMode(s, undefined)).toEqual({ value: false, valid: true });
+      expect(resolveRequestChanges(s, undefined)).toEqual({ value: false, valid: true });
+    }
+    for (const s of spellingsThatMeanOn) {
+      expect(resolveJsonResponseMode(s, undefined)).toEqual({ value: true, valid: true });
+      expect(resolveRequestChanges(s, undefined)).toEqual({ value: true, valid: true });
+    }
+  });
+
+  it("空串是正常的「未设置」，不是错误 —— 不该让调用方告警", () => {
+    // 空串是 default: "" 的常态。若把它算成 invalid，告警就会每次运行都刷屏，
+    // 真出问题时反而被噪音淹没。
+    expect(resolveJsonResponseMode("", { jsonResponseMode: false })).toEqual({
+      value: false,
+      valid: true,
+    });
+    expect(resolveRequestChanges("", undefined)).toEqual({ value: true, valid: true });
+  });
+
+  it("无法识别的拼写 valid=false（供调用方告警），并明确告知取到的是什么", () => {
+    // 刻意**不猜** no / off / 0：猜错比不猜更糟。所以返回 repoConfig ?? 默认，
+    // 同时把 valid=false 交出去让调用方喊一声。
+    for (const s of ["no", "off", "0", "maybe", "enabled"]) {
+      expect(resolveJsonResponseMode(s, undefined)).toEqual({ value: true, valid: false });
+      expect(resolveRequestChanges(s, undefined)).toEqual({ value: true, valid: false });
+    }
+    // repo config 仍然照旧生效（未设置 ≠ 拼错）
+    expect(resolveJsonResponseMode("off", { jsonResponseMode: false })).toEqual({
+      value: false,
+      valid: false,
+    });
+  });
+
+  it("显式输入优先于 repo config，且与原先的优先级完全一致", () => {
+    expect(resolveJsonResponseMode("false", { jsonResponseMode: true })).toEqual({
+      value: false,
+      valid: true,
+    });
+    expect(resolveJsonResponseMode("true", { jsonResponseMode: false })).toEqual({
+      value: true,
+      valid: true,
+    });
+    expect(resolveRequestChanges("false", { requestChanges: true }).value).toBe(false);
+    expect(resolveRequestChanges("", { requestChanges: false }).value).toBe(false);
+  });
+});
+
+/**
+ * `valid` 只有被 main.ts 用来告警才有意义。而这一段**没有任何自动化证据**：
+ * `tsconfig` 没开 `noUnusedLocals`，所以把告警整块删掉之后 `tsc` 仍是绿的；
+ * 上面那些行为测试测的是解析器，也仍全绿。唯一变化是**用户再也看不到告警** ——
+ * 恰好是这个 guard 存在的理由。
+ *
+ * 两个值本身的类型是安全的（`jsonResponseMode` / `requestChanges` 都流向
+ * `boolean` 形参，退回裸返回值会被 tsc 抓到），所以这里只钉「用了 valid 并告警」。
+ * 扫描是弱证据（R1081 已记），但这里没有更便宜的办法。
+ */
+describe("main.ts 真的会用 valid 告警（源码扫描，R1085）", () => {
+  const src = readFileSync(join(__dirname, "main.ts"), "utf8");
+
+  const warnsAfter = (marker: string): string =>
+    src.slice(src.indexOf(marker), src.indexOf(marker) + 320);
+
+  it("两个解析结果都解构出 valid", () => {
+    expect(src).toMatch(/const \{ value: jsonResponseMode, valid: jsonResponseModeValid \}/);
+    expect(src).toMatch(/const \{ value: requestChanges, valid: requestChangesValid \}/);
+  });
+
+  it("valid 为假时确实发出告警，且告警里带上原始输入值", () => {
+    for (const [flag, inputName] of [
+      ["!jsonResponseModeValid", "jsonResponseModeInput"],
+      ["!requestChangesValid", "requestChangesInput"],
+    ] as const) {
+      const seg = warnsAfter(flag);
+      expect(seg.length).toBeGreaterThan(0); // 锚点必须真的存在，否则下面全是空断言
+      expect(seg).toContain("core.warning");
+      // 告警必须带上用户实际写的那串，否则等于没告警
+      expect(seg).toContain(inputName);
+    }
   });
 });
 

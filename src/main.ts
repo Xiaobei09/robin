@@ -298,8 +298,28 @@ async function run(): Promise<void> {
         `Invalid max-comments value "${maxCommentsInput}", using default ${DEFAULT_MAX_COMMENTS}`,
       );
     }
-    const jsonResponseMode = resolveJsonResponseMode(jsonResponseModeInput, repoConfig);
-    const requestChanges = resolveRequestChanges(requestChangesInput, repoConfig);
+    const { value: jsonResponseMode, valid: jsonResponseModeValid } = resolveJsonResponseMode(
+      jsonResponseModeInput,
+      repoConfig,
+    );
+    if (!jsonResponseModeValid) {
+      // 静默退回默认是这个坑的全部危害：用户写了要关，实际没关，且看不出发生了什么。
+      // 这里刻意**不猜** `no` / `off` / `0` 是什么意思 —— 猜错比不猜更糟。
+      core.warning(
+        `Invalid use-json-response-mode value "${jsonResponseModeInput}"; expected "true" or "false". ` +
+          `Using ${jsonResponseMode}.`,
+      );
+    }
+    const { value: requestChanges, valid: requestChangesValid } = resolveRequestChanges(
+      requestChangesInput,
+      repoConfig,
+    );
+    if (!requestChangesValid) {
+      core.warning(
+        `Invalid request-changes value "${requestChangesInput}"; expected "true" or "false". ` +
+          `Using ${requestChanges}.`,
+      );
+    }
     const reasoningEffort = resolveReasoningEffort(reasoningEffortInput, repoConfig);
     if (reasoningEffort) {
       core.info(`Reasoning effort: ${reasoningEffort}`);

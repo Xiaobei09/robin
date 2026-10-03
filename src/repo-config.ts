@@ -161,17 +161,55 @@ export function resolveMaxDiffSize(
   };
 }
 
-export function resolveJsonResponseMode(actionInput: string, repoConfig?: RepoConfig): boolean {
-  if (actionInput === "true") return true;
-  if (actionInput === "false") return false;
-  return repoConfig?.jsonResponseMode ?? true;
+/**
+ * 解析布尔输入，供 `resolveJsonResponseMode` / `resolveRequestChanges` 共用。
+ *
+ * **归一化：trim + 小写。** 原先是精确比较 `actionInput === "true"`，于是
+ * `False` / `FALSE` / `" false"`（前后带空白）**一律落空**，静默退回默认 ——
+ * 而默认是 `true`。后果是**用户明确写了要关，实际没关**，且没有任何告警。
+ * 实测（probe）下列拼写全部静默失效：`False` `FALSE` ` false` `false ` `no` `off` `0`。
+ *
+ * 这在两个输入上的**真实风险并不相同**，所以两类拼写要分开看：
+ * - `request-changes` 在 `review.yml` 里声明为 `type: boolean`，GitHub 会归一化成
+ *   `"true"` / `"false"`，精确比较本来就不会漏；
+ * - `use-json-response-mode` 声明为 **`type: string`、`default: ""`**，
+ *   GitHub **不做任何归一化**、原样透传 —— 大小写与空白问题真实可达。
+ *
+ * `no` / `off` / `0` 归一化后仍不是 true/false。这类**故意不认**：把它们猜成
+ * false 会在用户写 `no` 时关掉一个他可能只是想"确认默认"的东西。正确做法是
+ * **如实告警**，而不是替用户猜。
+ *
+ * 返回 `valid` 就是为了让调用方能告警 —— 与 `resolveMaxComments` /
+ * `resolveMaxDiffSize` 同一套契约（见上面那段注释：「调用方**应当**就此告警，
+ * 否则用户会拿到一个自己没要求过的值而毫无察觉」）。
+ *
+ * 空串是**正常的"未设置"**，不是错误 ⇒ `valid: true`，不该告警。
+ */
+function resolveBooleanInput(
+  actionInput: string,
+  repoValue: boolean | undefined,
+  fallback: boolean,
+): { value: boolean; valid: boolean } {
+  const normalized = actionInput.trim().toLowerCase();
+  if (normalized === "true") return { value: true, valid: true };
+  if (normalized === "false") return { value: false, valid: true };
+  if (normalized === "") return { value: repoValue ?? fallback, valid: true };
+  return { value: repoValue ?? fallback, valid: false };
+}
+
+export function resolveJsonResponseMode(
+  actionInput: string,
+  repoConfig?: RepoConfig,
+): { value: boolean; valid: boolean } {
+  return resolveBooleanInput(actionInput, repoConfig?.jsonResponseMode, true);
 }
 
 /** Whether a High finding submits a blocking REQUEST_CHANGES review. Default true (gatekeeper). */
-export function resolveRequestChanges(actionInput: string, repoConfig?: RepoConfig): boolean {
-  if (actionInput === "true") return true;
-  if (actionInput === "false") return false;
-  return repoConfig?.requestChanges ?? true;
+export function resolveRequestChanges(
+  actionInput: string,
+  repoConfig?: RepoConfig,
+): { value: boolean; valid: boolean } {
+  return resolveBooleanInput(actionInput, repoConfig?.requestChanges, true);
 }
 
 /** Reasoning effort is provider configuration: explicit input first, then `.github/robin.yml`, else unset. */
