@@ -7,7 +7,7 @@ import {
 } from "./reasoning-fallback";
 import { GitUtils, isMissingFileError } from "./git-utils";
 import { ReviewParser, StructuredReview } from "./review-parser";
-import { shouldRetryStructuredReview } from "./review-retry";
+import { countFindings, shouldRelaunchEmptyReview, shouldRetryStructuredReview } from "./review-retry";
 import { GitHubReviewer, ROBIN_SIGNATURE } from "./github-reviewer";
 import {
   buildFailedStatusBody,
@@ -469,7 +469,12 @@ if (!failOnHighValid) {
       let parsedReview = ReviewParser.parseDetailed(reviewText);
       let findings = parsedReview.findings;
 
+      // R1091：显式记录「是否真的做过一次 JSON-only 重试」。重启判定必须依赖它，
+      // 否则会把块 A 已经判定为「真实 markdown 审查」的长 summary 响应丢弃并重启，
+      // 消息却谎称 after retry。
+      let attemptedJsonRetry = false;
       if (shouldRetryStructuredReview(findings, parsedReview.usedJson)) {
+        attemptedJsonRetry = true;
         core.warning("Structured review parse was empty; retrying once with JSON-only instructions.");
         await updateStatusComment(
           octokit,
@@ -495,46 +500,43 @@ if (!failOnHighValid) {
       }
 
       // R927：模型解析失败也换 CI（与 egress 瞬时故障同一 hop 上限）。
-      // 触发面收窄到「两次都没能产出 JSON」：usedJson==false 且 0 条发现。
+      // R1091：触发面必须是「**做过一次 JSON-only 重试后**仍无 JSON」——
+      // 与消息里的 after retry 逐字一致。旧判据只有 `count===0 && !usedJson`，
+      // 于是「非 JSON + 0 发现 + summary>40 字」这条被块 A 判为**真实 markdown 审查**
+      // 的响应（`shouldRetryStructuredReview` 返回 false，不重试）会被这里丢弃并重启，
+      // 而 `postReview` 本会把它作为 review body 发出去。
       // JSON 合法但 findings 为空（usedJson==true）是干净 PR 的正常形态，绝不能重开。
-      {
-        const count =
-          findings.high.length +
-          findings.medium.length +
-          findings.low.length +
-          findings.suggestions.length;
-        if (count === 0 && !parsedReview.usedJson) {
-          const parseErr = new Error(
-            "empty response from llm: review unparsable after retry (no JSON object found)"
-          );
-          const msg = parseErr.message;
-          await updateStatusComment(
-            octokit,
-            owner,
-            repo,
-            statusCommentId,
-            buildFailedStatusBody(msg, statusCommand)
-          );
-          const relaunchedParse =
-            octokit && statusPrNumber
-              ? await maybeRelaunchOnEgressFailure({
-                  octokit,
-                  owner: statusOwner,
-                  repo: statusRepo,
-                  prNumber: statusPrNumber,
-                  error: parseErr,
-                  enabled: relaunchEnabled,
-                  maxRelaunches,
-                  model: llmModel,
-                  githubToken: relaunchGithubToken,
-                })
-              : false;
-          core.setFailed(msg);
-          if (relaunchedParse) {
-            core.info("已发起换 CI；本次 run 将被新 run 取代。");
-          }
-          return;
+      if (shouldRelaunchEmptyReview(findings, parsedReview.usedJson, attemptedJsonRetry)) {
+        const parseErr = new Error(
+          "empty response from llm: review unparsable after retry (no JSON object found)"
+        );
+        const msg = parseErr.message;
+        await updateStatusComment(
+          octokit,
+          owner,
+          repo,
+          statusCommentId,
+          buildFailedStatusBody(msg, statusCommand)
+        );
+        const relaunchedParse =
+          octokit && statusPrNumber
+            ? await maybeRelaunchOnEgressFailure({
+                octokit,
+                owner: statusOwner,
+                repo: statusRepo,
+                prNumber: statusPrNumber,
+                error: parseErr,
+                enabled: relaunchEnabled,
+                maxRelaunches,
+                model: llmModel,
+                githubToken: relaunchGithubToken,
+              })
+            : false;
+        core.setFailed(msg);
+        if (relaunchedParse) {
+          core.info("已发起换 CI；本次 run 将被新 run 取代。");
         }
+        return;
       }
 
       core.info(`Found ${findings.high.length} high, ${findings.medium.length} medium, ${findings.low.length} low, ${findings.suggestions.length} suggestions`);
@@ -749,9 +751,7 @@ function buildCompletedStatusBody(
     ].join("\n");
   }
 
-  const totalFindings = findings
-    ? findings.high.length + findings.medium.length + findings.low.length + findings.suggestions.length
-    : 0;
+  const totalFindings = findings ? countFindings(findings) : 0;
   const result = totalFindings === 0
     ? "Nothing worth flagging — looks clean to me."
     : `I flagged ${totalFindings} thing${totalFindings === 1 ? "" : "s"} worth a look.`;

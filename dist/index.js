@@ -2077,7 +2077,12 @@ async function run() {
             core.info("Parsing review response...");
             let parsedReview = review_parser_1.ReviewParser.parseDetailed(reviewText);
             let findings = parsedReview.findings;
+            // R1091：显式记录「是否真的做过一次 JSON-only 重试」。重启判定必须依赖它，
+            // 否则会把块 A 已经判定为「真实 markdown 审查」的长 summary 响应丢弃并重启，
+            // 消息却谎称 after retry。
+            let attemptedJsonRetry = false;
             if ((0, review_retry_1.shouldRetryStructuredReview)(findings, parsedReview.usedJson)) {
+                attemptedJsonRetry = true;
                 core.warning("Structured review parse was empty; retrying once with JSON-only instructions.");
                 await (0, status_comment_1.updateStatusComment)(octokit, owner, repo, statusCommentId, buildProgressStatusBody("First pass returned no parseable findings — retrying with JSON-only instructions…", statusCommand, statusModel));
                 const retryText = (await runReview(llm, truncatedDiff, `${reviewInstructions}\n\nReturn ONLY a single valid JSON object. Do not use markdown.`, true)).content;
@@ -2085,36 +2090,34 @@ async function run() {
                 findings = parsedReview.findings;
             }
             // R927：模型解析失败也换 CI（与 egress 瞬时故障同一 hop 上限）。
-            // 触发面收窄到「两次都没能产出 JSON」：usedJson==false 且 0 条发现。
+            // R1091：触发面必须是「**做过一次 JSON-only 重试后**仍无 JSON」——
+            // 与消息里的 after retry 逐字一致。旧判据只有 `count===0 && !usedJson`，
+            // 于是「非 JSON + 0 发现 + summary>40 字」这条被块 A 判为**真实 markdown 审查**
+            // 的响应（`shouldRetryStructuredReview` 返回 false，不重试）会被这里丢弃并重启，
+            // 而 `postReview` 本会把它作为 review body 发出去。
             // JSON 合法但 findings 为空（usedJson==true）是干净 PR 的正常形态，绝不能重开。
-            {
-                const count = findings.high.length +
-                    findings.medium.length +
-                    findings.low.length +
-                    findings.suggestions.length;
-                if (count === 0 && !parsedReview.usedJson) {
-                    const parseErr = new Error("empty response from llm: review unparsable after retry (no JSON object found)");
-                    const msg = parseErr.message;
-                    await (0, status_comment_1.updateStatusComment)(octokit, owner, repo, statusCommentId, (0, status_comment_1.buildFailedStatusBody)(msg, statusCommand));
-                    const relaunchedParse = octokit && statusPrNumber
-                        ? await maybeRelaunchOnEgressFailure({
-                            octokit,
-                            owner: statusOwner,
-                            repo: statusRepo,
-                            prNumber: statusPrNumber,
-                            error: parseErr,
-                            enabled: relaunchEnabled,
-                            maxRelaunches,
-                            model: llmModel,
-                            githubToken: relaunchGithubToken,
-                        })
-                        : false;
-                    core.setFailed(msg);
-                    if (relaunchedParse) {
-                        core.info("已发起换 CI；本次 run 将被新 run 取代。");
-                    }
-                    return;
+            if ((0, review_retry_1.shouldRelaunchEmptyReview)(findings, parsedReview.usedJson, attemptedJsonRetry)) {
+                const parseErr = new Error("empty response from llm: review unparsable after retry (no JSON object found)");
+                const msg = parseErr.message;
+                await (0, status_comment_1.updateStatusComment)(octokit, owner, repo, statusCommentId, (0, status_comment_1.buildFailedStatusBody)(msg, statusCommand));
+                const relaunchedParse = octokit && statusPrNumber
+                    ? await maybeRelaunchOnEgressFailure({
+                        octokit,
+                        owner: statusOwner,
+                        repo: statusRepo,
+                        prNumber: statusPrNumber,
+                        error: parseErr,
+                        enabled: relaunchEnabled,
+                        maxRelaunches,
+                        model: llmModel,
+                        githubToken: relaunchGithubToken,
+                    })
+                    : false;
+                core.setFailed(msg);
+                if (relaunchedParse) {
+                    core.info("已发起换 CI；本次 run 将被新 run 取代。");
                 }
+                return;
             }
             core.info(`Found ${findings.high.length} high, ${findings.medium.length} medium, ${findings.low.length} low, ${findings.suggestions.length} suggestions`);
             const reviewer = new github_reviewer_1.GitHubReviewer(octokit, maxComments);
@@ -2278,9 +2281,7 @@ function buildCompletedStatusBody(command, findings, reasoningFallbackReason) {
             "Want the full review? Comment `/robin`.",
         ].join("\n");
     }
-    const totalFindings = findings
-        ? findings.high.length + findings.medium.length + findings.low.length + findings.suggestions.length
-        : 0;
+    const totalFindings = findings ? (0, review_retry_1.countFindings)(findings) : 0;
     const result = totalFindings === 0
         ? "Nothing worth flagging — looks clean to me."
         : `I flagged ${totalFindings} thing${totalFindings === 1 ? "" : "s"} worth a look.`;
@@ -3732,18 +3733,44 @@ exports.ReviewParser = ReviewParser;
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.countFindings = countFindings;
 exports.shouldRetryStructuredReview = shouldRetryStructuredReview;
+exports.shouldRelaunchEmptyReview = shouldRelaunchEmptyReview;
 const RETRY_SUMMARY_MAX_LENGTH = 40;
-function shouldRetryStructuredReview(findings, usedJson) {
-    const findingCount = findings.high.length +
+/** 四个严重度桶的总数。**只此一处**统计，避免 main.ts 再手写一遍求和。 */
+function countFindings(findings) {
+    return (findings.high.length +
         findings.medium.length +
         findings.low.length +
-        findings.suggestions.length;
-    if (findingCount > 0)
+        findings.suggestions.length);
+}
+function shouldRetryStructuredReview(findings, usedJson) {
+    if (countFindings(findings) > 0)
         return false;
     if (usedJson)
         return false;
     return findings.summary.trim().length <= RETRY_SUMMARY_MAX_LENGTH;
+}
+/**
+ * 是否该在「解析失败」时重启 CI。
+ *
+ * R1091：这里必须要求 `retried === true`。旧判据只有
+ * 「`countFindings === 0 && !usedJson`」，它**严格宽于** `shouldRetryStructuredReview`：
+ * 唯一差集是「非 JSON、0 条发现、summary 超过 40 字」。那种响应块 A 判定为
+ * **真实 markdown 审查**（不值得再问一遍 JSON），块 B 却把它**丢弃并重启 CI**，
+ * 失败消息还谎称 `after retry` —— 而根本没有重试过。`postReview` 会使用
+ * `findings.summary`（`github-reviewer.ts` 的 `buildReviewBody`），
+ * 所以丢掉的是真审查输出，还白烧一次 CI。
+ *
+ * 加上 `retried` 之后，语义与 `main.ts` 的注释「两次都没能产出 JSON」以及
+ * 失败消息里的 `after retry` **逐字一致**：只有先做过一次 JSON-only 重试、
+ * 且重试后仍然 `!usedJson && 0 发现`，才重启。
+ *
+ * `usedJson === true && 0 发现` 是干净 PR 的正常形态（模型给了合法 JSON、
+ * 只是没问题），**绝不重启** —— 这条没有随 `retried` 放松。
+ */
+function shouldRelaunchEmptyReview(findings, usedJson, retried) {
+    return retried && !usedJson && countFindings(findings) === 0;
 }
 //# sourceMappingURL=review-retry.js.map
 

@@ -362,4 +362,20 @@ describe("接线（源码扫描）：main.ts 里无法单测的契约", () => {
     expect(seg).toMatch(/core\.warning\(/);
     expect(seg).toMatch(/minCommandPermissionValid/);
   });
+
+  it("解析失败的重启必须以「真的重试过」为前提（R1091）", () => {
+    // 旧代码：`if (count === 0 && !parsedReview.usedJson)` —— 未重试也会重启，
+    // 丢弃被块 A 判定为真实 markdown 审查的长 summary 响应。
+    expect(src).not.toMatch(/count === 0 && !parsedReview\.usedJson/);
+
+    const anchor = src.indexOf("shouldRelaunchEmptyReview(");
+    expect(anchor).toBeGreaterThan(-1);
+    // 按行取（结构边界），不用固定字符窗。
+    const callLine = src.slice(anchor).split("\n")[0];
+    expect(callLine).toContain("attemptedJsonRetry");
+
+    // 门禁要真的被打开过，否则该重启时永不重启：重试块里必须置 true。
+    expect(src).toMatch(/let attemptedJsonRetry = false;/);
+    expect(src).toMatch(/attemptedJsonRetry = true;/);
+  });
 });
