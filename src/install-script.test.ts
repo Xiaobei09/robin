@@ -25,6 +25,21 @@ describe("curl installer", () => {
       stdio: "pipe",
     }).toString();
 
+  /** 期望安装器失败；返回它写到 stderr 的文本（已剥掉 ANSI 色码）。 */
+  const runFail = (env: Record<string, string> = {}): { code: number; stderr: string } => {
+    const r = cp.spawnSync("bash", [INSTALL], {
+      cwd: dir,
+      env: { ...process.env, ROBIN_SKILL: "0", ...env },
+      encoding: "utf8",
+    });
+    // 不剥色码的话断言里要写一堆转义，读起来没法看。
+    const strip = (s: string | null) => (s ?? "").replace(/\u001b\[[0-9;]*m/g, "");
+    expect(r.status).not.toBe(0);
+    return { code: r.status ?? -1, stderr: strip(r.stderr) + strip(r.stdout) };
+  };
+
+  const canonicalPath = () => path.join(dir, ".github", "workflows", "robin.yml");
+
   it("archives a historical workflow and creates the canonical workflow", () => {
     const workflows = path.join(dir, ".github", "workflows");
     fs.mkdirSync(workflows, { recursive: true });
@@ -357,5 +372,67 @@ describe("curl installer", () => {
     expect(
       fs.existsSync(path.join(dir, ".github", "robin-workflow-archive", "robin.yml.disabled")),
     ).toBe(true);
+  });
+
+  /**
+   * R1089。这段校验此前**两个方向都没有用例**（测试只用了合法的 `ROBIN_REF: "v1"`）。
+   *
+   * 旧实现只做字符白名单 `[A-Za-z0-9._/-]`，于是 `..`（git 明确禁止）被放行：
+   * `ROBIN_REF=../evil` 会写出 `uses: …/@../evil`、打印绿字
+   * "Created canonical … (ref: ../evil)" 并以 0 退出 —— 用户以为成功了，
+   * 直到 workflow 在运行时才炸。安装器的"校验"反而生产了它本该拦下的东西。
+   */
+  it.each([
+    "../evil",
+    "/foo",
+    "foo/",
+    "a//b",
+    "foo/.bar",
+    "foo./bar",
+    "foo.lock",
+    "a/b.lock",
+    "..",
+    ".",
+    // 段内的 `..`：git 禁止两个连续的点**出现在任何位置**，不只是整段等于 ".."。
+    // 这一条是我自己的表格测试抓出来的 —— 第一版实现只比较整段，`v1..v2` 这类
+    // 单段 ref 会被放行，而注释里却写着 "must not contain '..'"。
+    "v1..v2",
+    "a..b",
+    "release..1",
+  ])("拒绝 git 非法的 ref %j，并且不写任何 workflow", (ref) => {
+    const { stderr } = runFail({ ROBIN_REF: ref });
+
+    expect(stderr).toContain("Invalid ROBIN_REF");
+    // 报错文本必须带上用户实际写的那串，否则等于没报
+    expect(stderr).toContain(ref);
+    // 关键：失败必须是**干净**的 —— 不留下半成品 workflow 让用户去提交
+    expect(fs.existsSync(canonicalPath())).toBe(false);
+    expect(fs.existsSync(path.join(dir, ".github", "workflows"))).toBe(false);
+  });
+
+  it.each(["v1", "main", "feat/foo", "v1.2.3", "release-1.0_hotfix", "a-b_c.d"])(
+    "放行合法 ref %j 并原样写进 uses",
+    (ref) => {
+      run({ ROBIN_REF: ref });
+      expect(fs.readFileSync(canonicalPath(), "utf8")).toContain(`review.yml@${ref}`);
+    },
+  );
+
+  it("被继承的坏 ref 也要拦 —— 校验必须发生在继承之后", () => {
+    // 这条覆盖的是**另一条入口**：用户没传 ROBIN_REF，坏 ref 来自仓库里已有的
+    // robin.yml。若校验只放在读 ROBIN_REF 的地方而没覆盖继承路径，这里就会漏。
+    const workflowPath = canonicalPath();
+    fs.mkdirSync(path.dirname(workflowPath), { recursive: true });
+    fs.writeFileSync(
+      workflowPath,
+      "name: Robin\njobs:\n  review:\n    uses: antongulin/robin/.github/workflows/review.yml@v1..v2\n",
+    );
+
+    const { stderr } = runFail();
+
+    expect(stderr).toContain("Invalid ROBIN_REF");
+    expect(stderr).toContain("v1..v2");
+    // 原有的（坏的）文件应被留下、不被覆盖成别的 ref，用户才能自己去看
+    expect(fs.readFileSync(workflowPath, "utf8")).toContain("@v1..v2");
   });
 });

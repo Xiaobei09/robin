@@ -129,9 +129,35 @@ extract_with_overrides() {
     function pads(n, s) { s = ""; while (n-- > 0) s = s " "; return s }'
 }
 
-case "$REF" in
-  *[!A-Za-z0-9._/-]*|'') die "Invalid ROBIN_REF: $REF" ;;
-esac
+# Validate the ref the way git does, not just by character set (R1089). The original
+# check only rejected characters outside [A-Za-z0-9._/-], so `..` — which git forbids
+# outright — slipped through. `ROBIN_REF='../evil'` then wrote
+# `uses: antongulin/robin/.github/workflows/review.yml@../evil`, printed a green
+# "Created canonical … (ref: ../evil)" and exited 0, so the user believed it worked
+# and only found out when the workflow failed at run time. Same for a preserved ref:
+# this runs *after* the existing ref is carried over, so it covers both paths.
+# Segments are split with ${x%%/*} / ${x#*/} rather than word splitting so no glob
+# metacharacter can ever expand.
+is_valid_ref() {
+  case "$1" in
+    ''|*[!A-Za-z0-9._/-]*) return 1 ;;
+  esac
+  local ref="$1" part
+  while :; do
+    part="${ref%%/*}"
+    case "$part" in
+      ''|.|..) return 1 ;;     # empty segment, "." or ".."
+      *..*|.*|*.) return 1 ;;  # ".." anywhere (git forbids two consecutive dots),
+                               # or a segment starting/ending with "."
+      *.lock) return 1 ;;      # git forbids a ".lock" suffix
+    esac
+    [ "$ref" = "$part" ] && break
+    ref="${ref#*/}"
+  done
+  return 0
+}
+is_valid_ref "$REF" \
+  || die "Invalid ROBIN_REF: $REF (git ref names must not contain '..', an empty path segment, or a path segment starting/ending with '.')"
 
 tmp_workflow="$(mktemp)"
 trap 'rm -f "$tmp_workflow"' EXIT
