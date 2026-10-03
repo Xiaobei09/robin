@@ -383,8 +383,21 @@ describe("失败评论的 Reason：绝不为空，也必须说清真正原因", 
      * 断言用函数切片而不是全文件搜索：装饰逻辑只在写入点附近，搜全文会被
      * `decorateStatusCommentBody` 的 import 行本身命中而恒真（R941 的教训）。
      */
-    const sliceOf = (from: string, to: string): string =>
-      code.slice(code.indexOf(from), code.indexOf(to));
+    /**
+     * R1081：`postStatusComment` / `updateStatusComment` / `resolveStatusCommentId`
+     * 已从 `main.ts` 搬进 `status-comment.ts`（为了能直接测它们）。
+     *
+     * 下面三条守卫按函数名切片，所以必须换读另一个文件。**不能图省事把两个文件
+     * 拼起来当 `code`** —— 上面那条 `not.toMatch(/function buildFailedStatusBody/)`
+     * 正是靠「main.ts 里没有第二份实现」成立的，而 `buildFailedStatusBody` 的**产地
+     * 就在 status-comment.ts**，一拼就反而命中、测试变红。
+     * 两份源码各读各的，是这个约束的直接后果。
+     */
+    const statusCode = readFileSync(path.join(__dirname, "status-comment.ts"), "utf8")
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^[ \t]*\/\/.*$/gm, "");
+    const sliceOfStatus = (from: string, to: string): string =>
+      statusCode.slice(statusCode.indexOf(from), statusCode.indexOf(to));
 
     //
     // 判据必须是「`body:` 的**值**就是装饰调用」，不能只是「函数体里出现过这个标识符」。
@@ -401,7 +414,7 @@ describe("失败评论的 Reason：绝不为空，也必须说清真正原因", 
     };
 
     it("新建状态评论（postStatusComment）把 body 交给统一发布器 publishRobinComment", () => {
-      const seg = sliceOf("async function postStatusComment", "async function updateStatusComment");
+      const seg = sliceOfStatus("async function postStatusComment", "async function updateStatusComment");
       // 装饰不再发生在这个函数体里，而是收敛到 publishRobinComment 内（marker 单一来源）。
       // 这里钉的是「走了统一发布器」这条接线，装饰本身由下面那条 publishRobinComment 守卫覆盖。
       expect(seg).toContain("publishRobinComment");
@@ -409,7 +422,7 @@ describe("失败评论的 Reason：绝不为空，也必须说清真正原因", 
     });
 
     it("更新状态评论（updateStatusComment）的 body 值经过 decorateStatusCommentBody", () => {
-      const seg = sliceOf("async function updateStatusComment", "async function resolveStatusCommentId");
+      const seg = sliceOfStatus("async function updateStatusComment", "async function resolveStatusCommentId");
       expect(seg).toContain("updateComment");
       expect(bodyValueIsDecorated(seg)).toBe(true);
     });
@@ -425,7 +438,7 @@ describe("失败评论的 Reason：绝不为空，也必须说清真正原因", 
      * （与 M29 同一族：搜标识符 ≠ 钉住接线。）
      */
     it("委托出去的写入点仍把 body 交给 publishRobinComment 而非裸发", () => {
-      const seg = sliceOf("async function postStatusComment", "async function updateStatusComment");
+      const seg = sliceOfStatus("async function postStatusComment", "async function updateStatusComment");
       // 不允许绕过统一发布器直接建评论：那正是「每次重启多一条」的来源
       expect(seg).not.toContain("createComment");
     });

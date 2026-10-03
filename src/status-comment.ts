@@ -16,12 +16,16 @@
  *    original verdict rather than re-inheriting its own copy.
  */
 
+import * as core from "@actions/core";
+import type { ReviewerCommand } from "./commands";
 import {
   ROBIN_BOT_LOGIN,
   ROBIN_SIGNATURE,
   REVIEW_MARKER,
   decorateRobinCommentBody,
+  deletePreviousReviewComments,
   findExistingReviewComment,
+  publishRobinComment,
 } from "./github-reviewer";
 
 /**
@@ -182,3 +186,119 @@ export async function findLatestStatusComment(
   }
 }
 
+/*
+ * 以下三个函数原先住在 `main.ts`，是模块私有的。
+ *
+ * **为什么搬出来。** `main.ts` 一被 import 就整个 `run()` 起来，所以模块私有的
+ * 辅助函数永远拿不到测试 —— 于是关于它们的行为只能写**源码扫描**式的断言，
+ * 而扫描能防「被改坏」、防不了「逻辑本来就是错的」。R941 已用同一手法治过
+ * 同类问题（把状态评论的正文构造器搬到这里），本轮是第二次。
+ *
+ * 搬动的直接收益：`resolveStatusCommentId` 是整条链的编排点
+ * （认领或新建 → 清理其它 Robin 评论 → 返回 keepId），
+ * 而 R1077 的缺陷恰恰只在**它与 hop 记账的组合**上出现。
+ * 它现在可以被行为测试直接调用，而不必靠 main.ts 的源码扫描守着接线。
+ *
+ * 三个函数的名字与签名保持不变，所以 `main.ts` 的 11 个调用点一行未改。
+ */
+/**
+ * Post Robin's single comment for this run — or adopt the one already there.
+ *
+ * Delegates to `publishRobinComment`, which does the paginated lookup and then either
+ * PATCHes the existing marker-carrying comment or POSTs a new one. That is the entire
+ * restart story: run 2 rewrites run 1's comment instead of adding a sibling, so a PR
+ * whose review workflow failed twice still shows exactly one Robin comment.
+ */
+export async function postStatusComment(
+  octokit: any,
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  command: ReviewerCommand,
+  model: string,
+  inheritedVerdict?: string
+): Promise<number | undefined> {
+  return publishRobinComment(
+    octokit,
+    owner,
+    repo,
+    issueNumber,
+    buildInitialStatusBody(
+      command === "summary" ? "summary" : "review",
+      model,
+      inheritedVerdict
+    )
+  );
+}
+
+export async function updateStatusComment(
+  octokit: any,
+  owner: string,
+  repo: string,
+  commentId: number | undefined,
+  body: string
+): Promise<void> {
+  if (!commentId) return;
+
+  try {
+    await octokit.rest.issues.updateComment({
+      owner,
+      repo,
+      comment_id: commentId,
+      body: decorateStatusCommentBody(body),
+    });
+  } catch (error) {
+    core.warning(`Could not update status comment: ${error}`);
+  }
+}
+
+/**
+ * Reuse the previous run's status comment when there is one.
+ *
+ * Every run used to create a fresh comment, so a PR reviewed several times carried several
+ * "On it" comments and the newest could scroll out of view. A retried run now updates the
+ * existing comment in place and carries the previous verdict forward, so the evaluation the
+ * reader could already see is inherited instead of vanishing the moment a retry starts.
+ *
+ * Whichever branch it takes, it then drops Robin's *other* marked comments. Those only exist
+ * on PRs reviewed before the marker was unified, but leaving them behind is exactly the
+ * pile-up this function exists to remove. The cleanup requires all three of "carries the
+ * marker", "authored by `github-actions[bot]`" and "is not the comment we just kept" —
+ * the author check alone would reach unrelated comments from any other tool in the consumer
+ * repo that comments as the default token (R1077).
+ */
+export async function resolveStatusCommentId(
+  octokit: any,
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  command: ReviewerCommand,
+  model: string
+): Promise<number | undefined> {
+  const existing = await findLatestStatusComment(octokit, owner, repo, issueNumber);
+
+  let statusCommentId: number | undefined;
+  if (!existing) {
+    statusCommentId = await postStatusComment(octokit, owner, repo, issueNumber, command, model);
+  } else {
+    const inheritedVerdict = extractInheritedVerdict(existing.body);
+    core.info(
+      `Adopting Robin status comment #${existing.id} from a previous run` +
+        (inheritedVerdict ? ` (carrying over: ${inheritedVerdict})` : "")
+    );
+    await updateStatusComment(
+      octokit,
+      owner,
+      repo,
+      existing.id,
+      buildInitialStatusBody(command === "summary" ? "summary" : "review", model, inheritedVerdict)
+    );
+    statusCommentId = existing.id;
+  }
+
+  const removed = await deletePreviousReviewComments(octokit, owner, repo, issueNumber, statusCommentId);
+  if (removed > 0) {
+    core.info(`Removed ${removed} duplicate Robin comment(s) from earlier runs.`);
+  }
+  return statusCommentId;
+}

@@ -1868,7 +1868,7 @@ async function run() {
         core.info(`Running /${command} on PR #${prNumber} in ${owner}/${repo}`);
         statusCommand = command === "summary" ? "summary" : "review";
         statusModel = model || "not configured";
-        statusCommentId = await resolveStatusCommentId(octokit, owner, repo, prNumber, command, statusModel);
+        statusCommentId = await (0, status_comment_1.resolveStatusCommentId)(octokit, owner, repo, prNumber, command, statusModel);
         onJobCancelled = async () => {
             if (octokit && statusCommentId) {
                 // The SIGTERM grace period is short — never let the superseded check
@@ -1878,7 +1878,7 @@ async function run() {
                     isSupersededByNewerRun(octokit, statusOwner, statusRepo),
                     new Promise((resolve) => setTimeout(() => resolve(false), 3000).unref()),
                 ]);
-                await updateStatusComment(octokit, statusOwner, statusRepo, statusCommentId, superseded
+                await (0, status_comment_1.updateStatusComment)(octokit, statusOwner, statusRepo, statusCommentId, superseded
                     ? buildSupersededStatusBody(statusCommand)
                     : buildCancelledStatusBody(statusCommand));
             }
@@ -1914,7 +1914,7 @@ async function run() {
         const diff = await gitUtils.getPullRequestDiff(owner, repo, prNumber);
         if (!diff || diff.trim().length === 0) {
             core.warning("No diff found for this PR.");
-            await updateStatusComment(octokit, owner, repo, statusCommentId, (0, status_comment_1.buildFailedStatusBody)("No diff found for this pull request.", statusCommand));
+            await (0, status_comment_1.updateStatusComment)(octokit, owner, repo, statusCommentId, (0, status_comment_1.buildFailedStatusBody)("No diff found for this pull request.", statusCommand));
             return;
         }
         const diffFiles = (0, diff_filter_1.splitDiffIntoFiles)(diff);
@@ -1924,13 +1924,13 @@ async function run() {
         }
         if (diffFiles.length > 0 && !filteredDiff.trim()) {
             core.info("All changed files were skipped by diff filters; no LLM review needed.");
-            await updateStatusComment(octokit, owner, repo, statusCommentId, buildSkippedFilterStatusBody(removedFiles));
+            await (0, status_comment_1.updateStatusComment)(octokit, owner, repo, statusCommentId, buildSkippedFilterStatusBody(removedFiles));
             return;
         }
         const reviewDiff = filteredDiff.trim() ? filteredDiff : diff;
         if (!reviewDiff.trim()) {
             core.warning("No reviewable diff remained after filtering skipped paths.");
-            await updateStatusComment(octokit, owner, repo, statusCommentId, (0, status_comment_1.buildFailedStatusBody)("No reviewable diff remained after filtering skipped paths.", statusCommand));
+            await (0, status_comment_1.updateStatusComment)(octokit, owner, repo, statusCommentId, (0, status_comment_1.buildFailedStatusBody)("No reviewable diff remained after filtering skipped paths.", statusCommand));
             return;
         }
         const truncatedDiff = reviewDiff.length > maxDiffSize
@@ -1941,7 +1941,7 @@ async function run() {
             ? await loadReviewInstructions(octokit, gitUtils, owner, repo, prNumber, inlineReviewInstructions, reviewInstructionsFile, baseRef)
             : "";
         const llm = new llm_client_1.LLMClient(baseUrl, apiKey, model, maxOutputTokens, llmTimeoutMs, llmMaxAttempts, llmTemperature, async (detail) => {
-            await updateStatusComment(octokit, owner, repo, statusCommentId, buildProgressStatusBody(detail, statusCommand, statusModel));
+            await (0, status_comment_1.updateStatusComment)(octokit, owner, repo, statusCommentId, buildProgressStatusBody(detail, statusCommand, statusModel));
         }, reasoningEffort);
         const useJsonMode = command === "review" && jsonResponseMode;
         let reviewText;
@@ -1959,7 +1959,7 @@ async function run() {
                 issue_number: prNumber,
                 body: ["## " + github_reviewer_1.ROBIN_SIGNATURE + " · Summary", "", reviewText].join("\n"),
             });
-            await updateStatusComment(octokit, owner, repo, statusCommentId, buildCompletedStatusBody("summary", undefined, llm.getReasoningFallbackReason()));
+            await (0, status_comment_1.updateStatusComment)(octokit, owner, repo, statusCommentId, buildCompletedStatusBody("summary", undefined, llm.getReasoningFallbackReason()));
         }
         else {
             // Full review parsed and posted as a review
@@ -1968,7 +1968,7 @@ async function run() {
             let findings = parsedReview.findings;
             if ((0, review_retry_1.shouldRetryStructuredReview)(findings, parsedReview.usedJson)) {
                 core.warning("Structured review parse was empty; retrying once with JSON-only instructions.");
-                await updateStatusComment(octokit, owner, repo, statusCommentId, buildProgressStatusBody("First pass returned no parseable findings — retrying with JSON-only instructions…", statusCommand, statusModel));
+                await (0, status_comment_1.updateStatusComment)(octokit, owner, repo, statusCommentId, buildProgressStatusBody("First pass returned no parseable findings — retrying with JSON-only instructions…", statusCommand, statusModel));
                 const retryText = (await runReview(llm, truncatedDiff, `${reviewInstructions}\n\nReturn ONLY a single valid JSON object. Do not use markdown.`, true)).content;
                 parsedReview = review_parser_1.ReviewParser.parseDetailed(retryText);
                 findings = parsedReview.findings;
@@ -1984,7 +1984,7 @@ async function run() {
                 if (count === 0 && !parsedReview.usedJson) {
                     const parseErr = new Error("empty response from llm: review unparsable after retry (no JSON object found)");
                     const msg = parseErr.message;
-                    await updateStatusComment(octokit, owner, repo, statusCommentId, (0, status_comment_1.buildFailedStatusBody)(msg, statusCommand));
+                    await (0, status_comment_1.updateStatusComment)(octokit, owner, repo, statusCommentId, (0, status_comment_1.buildFailedStatusBody)(msg, statusCommand));
                     const relaunchedParse = octokit && statusPrNumber
                         ? await maybeRelaunchOnEgressFailure({
                             octokit,
@@ -2008,7 +2008,7 @@ async function run() {
             core.info(`Found ${findings.high.length} high, ${findings.medium.length} medium, ${findings.low.length} low, ${findings.suggestions.length} suggestions`);
             const reviewer = new github_reviewer_1.GitHubReviewer(octokit, maxComments);
             await reviewer.postReview(owner, repo, prNumber, findings, requestChanges);
-            await updateStatusComment(octokit, owner, repo, statusCommentId, buildCompletedStatusBody("review", findings, llm.getReasoningFallbackReason()));
+            await (0, status_comment_1.updateStatusComment)(octokit, owner, repo, statusCommentId, buildCompletedStatusBody("review", findings, llm.getReasoningFallbackReason()));
             if (findings.high.length > 0 && failOnHigh) {
                 core.setFailed(`Found ${findings.high.length} high severity issue(s). Failing check.`);
             }
@@ -2027,7 +2027,7 @@ async function run() {
         // 所以永久性错误的 fail-closed 完全不受影响。
         const message = (0, llm_retry_1.errorMessage)(error);
         if (octokit && statusOwner && statusRepo && statusCommentId) {
-            await updateStatusComment(octokit, statusOwner, statusRepo, statusCommentId, (0, status_comment_1.buildFailedStatusBody)(message, statusCommand));
+            await (0, status_comment_1.updateStatusComment)(octokit, statusOwner, statusRepo, statusCommentId, (0, status_comment_1.buildFailedStatusBody)(message, statusCommand));
         }
         // 「换出口」放在失败状态评论之后：先让这一轮的结论落进评论（新 run 会继承），
         // 再决定要不要另起一个 CI。反过来的话，新 run 继承到的就是一条还没写完的评论。
@@ -2139,66 +2139,6 @@ async function addEyesReaction(octokit, owner, repo, commentId) {
     catch (error) {
         core.warning(`Could not add eyes reaction to trigger comment: ${error}`);
     }
-}
-/**
- * Post Robin's single comment for this run — or adopt the one already there.
- *
- * Delegates to `publishRobinComment`, which does the paginated lookup and then either
- * PATCHes the existing marker-carrying comment or POSTs a new one. That is the entire
- * restart story: run 2 rewrites run 1's comment instead of adding a sibling, so a PR
- * whose review workflow failed twice still shows exactly one Robin comment.
- */
-async function postStatusComment(octokit, owner, repo, issueNumber, command, model, inheritedVerdict) {
-    return (0, github_reviewer_1.publishRobinComment)(octokit, owner, repo, issueNumber, (0, status_comment_1.buildInitialStatusBody)(command === "summary" ? "summary" : "review", model, inheritedVerdict));
-}
-async function updateStatusComment(octokit, owner, repo, commentId, body) {
-    if (!commentId)
-        return;
-    try {
-        await octokit.rest.issues.updateComment({
-            owner,
-            repo,
-            comment_id: commentId,
-            body: (0, status_comment_1.decorateStatusCommentBody)(body),
-        });
-    }
-    catch (error) {
-        core.warning(`Could not update status comment: ${error}`);
-    }
-}
-/**
- * Reuse the previous run's status comment when there is one.
- *
- * Every run used to create a fresh comment, so a PR reviewed several times carried several
- * "On it" comments and the newest could scroll out of view. A retried run now updates the
- * existing comment in place and carries the previous verdict forward, so the evaluation the
- * reader could already see is inherited instead of vanishing the moment a retry starts.
- *
- * Whichever branch it takes, it then drops Robin's *other* marked comments. Those only exist
- * on PRs reviewed before the marker was unified, but leaving them behind is exactly the
- * pile-up this function exists to remove. The cleanup requires all three of "carries the
- * marker", "authored by `github-actions[bot]`" and "is not the comment we just kept" —
- * the author check alone would reach unrelated comments from any other tool in the consumer
- * repo that comments as the default token (R1077).
- */
-async function resolveStatusCommentId(octokit, owner, repo, issueNumber, command, model) {
-    const existing = await (0, status_comment_1.findLatestStatusComment)(octokit, owner, repo, issueNumber);
-    let statusCommentId;
-    if (!existing) {
-        statusCommentId = await postStatusComment(octokit, owner, repo, issueNumber, command, model);
-    }
-    else {
-        const inheritedVerdict = (0, status_comment_1.extractInheritedVerdict)(existing.body);
-        core.info(`Adopting Robin status comment #${existing.id} from a previous run` +
-            (inheritedVerdict ? ` (carrying over: ${inheritedVerdict})` : ""));
-        await updateStatusComment(octokit, owner, repo, existing.id, (0, status_comment_1.buildInitialStatusBody)(command === "summary" ? "summary" : "review", model, inheritedVerdict));
-        statusCommentId = existing.id;
-    }
-    const removed = await (0, github_reviewer_1.deletePreviousReviewComments)(octokit, owner, repo, issueNumber, statusCommentId);
-    if (removed > 0) {
-        core.info(`Removed ${removed} duplicate Robin comment(s) from earlier runs.`);
-    }
-    return statusCommentId;
 }
 function buildCompletedStatusBody(command, findings, reasoningFallbackReason) {
     const fallbackNotice = (0, reasoning_fallback_1.buildReasoningFallbackNotice)(reasoningFallbackReason);
@@ -3632,7 +3572,7 @@ function shouldRetryStructuredReview(findings, usedJson) {
 /***/ }),
 
 /***/ 3523:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 "use strict";
 
@@ -3653,6 +3593,39 @@ function shouldRetryStructuredReview(findings, usedJson) {
  *    forward. The line is scanned from the *end* so that a third run still finds the
  *    original verdict rather than re-inheriting its own copy.
  */
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.LAST_RESULT_PREFIX = exports.STATUS_COMMENT_MARKER = void 0;
 exports.buildFailedStatusBody = buildFailedStatusBody;
@@ -3660,6 +3633,10 @@ exports.decorateStatusCommentBody = decorateStatusCommentBody;
 exports.extractInheritedVerdict = extractInheritedVerdict;
 exports.buildInitialStatusBody = buildInitialStatusBody;
 exports.findLatestStatusComment = findLatestStatusComment;
+exports.postStatusComment = postStatusComment;
+exports.updateStatusComment = updateStatusComment;
+exports.resolveStatusCommentId = resolveStatusCommentId;
+const core = __importStar(__nccwpck_require__(7484));
 const github_reviewer_1 = __nccwpck_require__(268);
 /**
  * Invisible marker that identifies the one Robin comment on an issue.
@@ -3788,6 +3765,81 @@ async function findLatestStatusComment(octokit, owner, repo, issueNumber) {
     catch {
         return undefined;
     }
+}
+/*
+ * 以下三个函数原先住在 `main.ts`，是模块私有的。
+ *
+ * **为什么搬出来。** `main.ts` 一被 import 就整个 `run()` 起来，所以模块私有的
+ * 辅助函数永远拿不到测试 —— 于是关于它们的行为只能写**源码扫描**式的断言，
+ * 而扫描能防「被改坏」、防不了「逻辑本来就是错的」。R941 已用同一手法治过
+ * 同类问题（把状态评论的正文构造器搬到这里），本轮是第二次。
+ *
+ * 搬动的直接收益：`resolveStatusCommentId` 是整条链的编排点
+ * （认领或新建 → 清理其它 Robin 评论 → 返回 keepId），
+ * 而 R1077 的缺陷恰恰只在**它与 hop 记账的组合**上出现。
+ * 它现在可以被行为测试直接调用，而不必靠 main.ts 的源码扫描守着接线。
+ *
+ * 三个函数的名字与签名保持不变，所以 `main.ts` 的 11 个调用点一行未改。
+ */
+/**
+ * Post Robin's single comment for this run — or adopt the one already there.
+ *
+ * Delegates to `publishRobinComment`, which does the paginated lookup and then either
+ * PATCHes the existing marker-carrying comment or POSTs a new one. That is the entire
+ * restart story: run 2 rewrites run 1's comment instead of adding a sibling, so a PR
+ * whose review workflow failed twice still shows exactly one Robin comment.
+ */
+async function postStatusComment(octokit, owner, repo, issueNumber, command, model, inheritedVerdict) {
+    return (0, github_reviewer_1.publishRobinComment)(octokit, owner, repo, issueNumber, buildInitialStatusBody(command === "summary" ? "summary" : "review", model, inheritedVerdict));
+}
+async function updateStatusComment(octokit, owner, repo, commentId, body) {
+    if (!commentId)
+        return;
+    try {
+        await octokit.rest.issues.updateComment({
+            owner,
+            repo,
+            comment_id: commentId,
+            body: decorateStatusCommentBody(body),
+        });
+    }
+    catch (error) {
+        core.warning(`Could not update status comment: ${error}`);
+    }
+}
+/**
+ * Reuse the previous run's status comment when there is one.
+ *
+ * Every run used to create a fresh comment, so a PR reviewed several times carried several
+ * "On it" comments and the newest could scroll out of view. A retried run now updates the
+ * existing comment in place and carries the previous verdict forward, so the evaluation the
+ * reader could already see is inherited instead of vanishing the moment a retry starts.
+ *
+ * Whichever branch it takes, it then drops Robin's *other* marked comments. Those only exist
+ * on PRs reviewed before the marker was unified, but leaving them behind is exactly the
+ * pile-up this function exists to remove. The cleanup requires all three of "carries the
+ * marker", "authored by `github-actions[bot]`" and "is not the comment we just kept" —
+ * the author check alone would reach unrelated comments from any other tool in the consumer
+ * repo that comments as the default token (R1077).
+ */
+async function resolveStatusCommentId(octokit, owner, repo, issueNumber, command, model) {
+    const existing = await findLatestStatusComment(octokit, owner, repo, issueNumber);
+    let statusCommentId;
+    if (!existing) {
+        statusCommentId = await postStatusComment(octokit, owner, repo, issueNumber, command, model);
+    }
+    else {
+        const inheritedVerdict = extractInheritedVerdict(existing.body);
+        core.info(`Adopting Robin status comment #${existing.id} from a previous run` +
+            (inheritedVerdict ? ` (carrying over: ${inheritedVerdict})` : ""));
+        await updateStatusComment(octokit, owner, repo, existing.id, buildInitialStatusBody(command === "summary" ? "summary" : "review", model, inheritedVerdict));
+        statusCommentId = existing.id;
+    }
+    const removed = await (0, github_reviewer_1.deletePreviousReviewComments)(octokit, owner, repo, issueNumber, statusCommentId);
+    if (removed > 0) {
+        core.info(`Removed ${removed} duplicate Robin comment(s) from earlier runs.`);
+    }
+    return statusCommentId;
 }
 //# sourceMappingURL=status-comment.js.map
 

@@ -8,13 +8,14 @@ import {
 import { GitUtils } from "./git-utils";
 import { ReviewParser, StructuredReview } from "./review-parser";
 import { shouldRetryStructuredReview } from "./review-retry";
-import { GitHubReviewer, ROBIN_SIGNATURE, deletePreviousReviewComments, publishRobinComment } from "./github-reviewer";
+import { GitHubReviewer, ROBIN_SIGNATURE } from "./github-reviewer";
 import {
   buildFailedStatusBody,
   buildInitialStatusBody,
-  decorateStatusCommentBody,
   extractInheritedVerdict,
-  findLatestStatusComment,
+  postStatusComment,
+  resolveStatusCommentId,
+  updateStatusComment,
 } from "./status-comment";
 import { errorMessage } from "./llm-retry";
 import {
@@ -661,108 +662,6 @@ async function addEyesReaction(
   } catch (error) {
     core.warning(`Could not add eyes reaction to trigger comment: ${error}`);
   }
-}
-
-/**
- * Post Robin's single comment for this run — or adopt the one already there.
- *
- * Delegates to `publishRobinComment`, which does the paginated lookup and then either
- * PATCHes the existing marker-carrying comment or POSTs a new one. That is the entire
- * restart story: run 2 rewrites run 1's comment instead of adding a sibling, so a PR
- * whose review workflow failed twice still shows exactly one Robin comment.
- */
-async function postStatusComment(
-  octokit: any,
-  owner: string,
-  repo: string,
-  issueNumber: number,
-  command: ReviewerCommand,
-  model: string,
-  inheritedVerdict?: string
-): Promise<number | undefined> {
-  return publishRobinComment(
-    octokit,
-    owner,
-    repo,
-    issueNumber,
-    buildInitialStatusBody(
-      command === "summary" ? "summary" : "review",
-      model,
-      inheritedVerdict
-    )
-  );
-}
-
-async function updateStatusComment(
-  octokit: any,
-  owner: string,
-  repo: string,
-  commentId: number | undefined,
-  body: string
-): Promise<void> {
-  if (!commentId) return;
-
-  try {
-    await octokit.rest.issues.updateComment({
-      owner,
-      repo,
-      comment_id: commentId,
-      body: decorateStatusCommentBody(body),
-    });
-  } catch (error) {
-    core.warning(`Could not update status comment: ${error}`);
-  }
-}
-
-/**
- * Reuse the previous run's status comment when there is one.
- *
- * Every run used to create a fresh comment, so a PR reviewed several times carried several
- * "On it" comments and the newest could scroll out of view. A retried run now updates the
- * existing comment in place and carries the previous verdict forward, so the evaluation the
- * reader could already see is inherited instead of vanishing the moment a retry starts.
- *
- * Whichever branch it takes, it then drops Robin's *other* marked comments. Those only exist
- * on PRs reviewed before the marker was unified, but leaving them behind is exactly the
- * pile-up this function exists to remove. The cleanup requires all three of "carries the
- * marker", "authored by `github-actions[bot]`" and "is not the comment we just kept" —
- * the author check alone would reach unrelated comments from any other tool in the consumer
- * repo that comments as the default token (R1077).
- */
-async function resolveStatusCommentId(
-  octokit: any,
-  owner: string,
-  repo: string,
-  issueNumber: number,
-  command: ReviewerCommand,
-  model: string
-): Promise<number | undefined> {
-  const existing = await findLatestStatusComment(octokit, owner, repo, issueNumber);
-
-  let statusCommentId: number | undefined;
-  if (!existing) {
-    statusCommentId = await postStatusComment(octokit, owner, repo, issueNumber, command, model);
-  } else {
-    const inheritedVerdict = extractInheritedVerdict(existing.body);
-    core.info(
-      `Adopting Robin status comment #${existing.id} from a previous run` +
-        (inheritedVerdict ? ` (carrying over: ${inheritedVerdict})` : "")
-    );
-    await updateStatusComment(
-      octokit,
-      owner,
-      repo,
-      existing.id,
-      buildInitialStatusBody(command === "summary" ? "summary" : "review", model, inheritedVerdict)
-    );
-    statusCommentId = existing.id;
-  }
-
-  const removed = await deletePreviousReviewComments(octokit, owner, repo, issueNumber, statusCommentId);
-  if (removed > 0) {
-    core.info(`Removed ${removed} duplicate Robin comment(s) from earlier runs.`);
-  }
-  return statusCommentId;
 }
 
 function buildCompletedStatusBody(

@@ -10,6 +10,7 @@ import {
   buildInitialStatusBody,
   decorateStatusCommentBody,
   findLatestStatusComment,
+  resolveStatusCommentId,
 } from "./status-comment";
 import { planRelaunch, RELAUNCH_MARKER, resolveHeadSha } from "./relaunch";
 
@@ -86,35 +87,17 @@ function relaunchComments(comments: Comment[]): Comment[] {
 }
 
 /**
- * 一轮 run 的骨架，**严格照 `main.ts` 的顺序**：
- *   resolveStatusCommentId（认领或新建状态评论 → 清理其它 Robin 评论）
- *   → 干活（这里恒定失败：模拟出口瞬时故障）
- *   → maybeRelaunchOnEgressFailure（读回 hop，决定要不要发重启评论）
+ * 一轮 run 的骨架，**直接调用真实的 `resolveStatusCommentId`**，不是手写复刻。
+ *
+ * R1081 之前它住在 `main.ts` 且是模块私有的，于是本文件只能照着源码复刻一遍编排
+ * —— 复刻件与真件会漂移（改了一边忘了另一边，测试照样绿）。
+ * 现在编排本身是导出的，测试跑的是生产代码。
  */
 async function simulateRun(store: ReturnType<typeof makeStore>, maxRelaunches = 2) {
   const { octokit, comments } = store;
 
-  // --- resolveStatusCommentId ---
-  const existing = await findLatestStatusComment(octokit, OWNER, REPO, PR);
-  let statusCommentId: number | undefined;
-  if (!existing) {
-    statusCommentId = await publishRobinComment(
-      octokit,
-      OWNER,
-      REPO,
-      PR,
-      buildInitialStatusBody("review", "model-x")
-    );
-  } else {
-    await octokit.rest.issues.updateComment({
-      owner: OWNER,
-      repo: REPO,
-      comment_id: existing.id,
-      body: decorateStatusCommentBody(buildInitialStatusBody("review", "model-x")),
-    });
-    statusCommentId = existing.id;
-  }
-  await deletePreviousReviewComments(octokit, OWNER, REPO, PR, statusCommentId);
+  // --- resolveStatusCommentId：认领或新建状态评论 → 清理其它 Robin 评论 ---
+  await resolveStatusCommentId(octokit, OWNER, REPO, PR, "review", "model-x");
 
   // --- 干活失败：出口瞬时故障 ---
   const plan = await planRelaunch({
@@ -182,14 +165,7 @@ describe("跨模块：评论去重与 hop 记账串在一条链上", () => {
     const before = relaunchComments(store.comments).length;
 
     // 第三轮：LLM 成功 ⇒ 不发重启评论，但 resolveStatusCommentId 的清理照跑。
-    const existing = await findLatestStatusComment(store.octokit, OWNER, REPO, PR);
-    await store.octokit.rest.issues.updateComment({
-      owner: OWNER,
-      repo: REPO,
-      comment_id: existing!.id,
-      body: decorateStatusCommentBody(buildInitialStatusBody("review", "model-x")),
-    });
-    await deletePreviousReviewComments(store.octokit, OWNER, REPO, PR, existing!.id);
+    await resolveStatusCommentId(store.octokit, OWNER, REPO, PR, "review", "model-x");
 
     // 清理只针对带 marker 的 Robin 评论；重启评论带的是另一种 marker。
     expect(relaunchComments(store.comments)).toHaveLength(before);
@@ -223,20 +199,78 @@ describe("跨模块：评论去重与 hop 记账串在一条链上", () => {
   });
 });
 
-describe("跨模块：接线（源码扫描）", () => {
-  const src = readFileSync(join(__dirname, "main.ts"), "utf8");
-
-  it("清理用的 keepId 就是本轮认领/新建的状态评论 id", () => {
-    // 若这里传错（比如传 undefined 或别的 id），清理会把唯一那条 Robin 评论删掉。
-    expect(src).toMatch(/deletePreviousReviewComments\(\s*octokit,\s*owner,\s*repo,\s*issueNumber,\s*statusCommentId\s*\)/);
+describe("resolveStatusCommentId：从源码扫描升级为行为测试（R1081）", () => {
+  /**
+   * R1081 之前，这个函数是 `main.ts` 的模块私有，而 `main.ts` 一被 import 就整个
+   * `run()` 起来 —— 所以关于它只能写**源码扫描**式断言。扫描能防「被改坏」，
+   * 防不了「逻辑本来就是错的」：keepId 传错对象、清理早于认领、返回 undefined
+   * 这三种错误写法都不会让一行 `toMatch` 变红。
+   *
+   * 搬成导出之后，下面每一条都是真的调用生产代码。
+   */
+  it("首次运行新建一条，返回它的 id", async () => {
+    const store = makeStore();
+    const id = await resolveStatusCommentId(store.octokit, OWNER, REPO, PR, "review", "model-x");
+    expect(id).toBe(1000);
+    expect(markedRobinComments(store.comments)).toHaveLength(1);
   });
 
+  it("再次运行认领同一条（id 不变），不会新建第二条", async () => {
+    const store = makeStore();
+    const first = await resolveStatusCommentId(store.octokit, OWNER, REPO, PR, "review", "model-x");
+    const second = await resolveStatusCommentId(store.octokit, OWNER, REPO, PR, "review", "model-x");
+    expect(second).toBe(first);
+    expect(markedRobinComments(store.comments)).toHaveLength(1);
+  });
+
+  it("返回的 id 就是它保住的那条 —— 清理不会误删它自己", async () => {
+    // 传错 keepId（比如传 undefined）时，这条唯一评论会被删掉 ⇒ 返回的 id 变成死链。
+    const store = makeStore();
+    const id = await resolveStatusCommentId(store.octokit, OWNER, REPO, PR, "review", "model-x");
+    expect(store.comments.some((c) => c.id === id)).toBe(true);
+    await resolveStatusCommentId(store.octokit, OWNER, REPO, PR, "review", "model-x");
+    expect(store.comments.filter((c) => c.id === id)).toHaveLength(1);
+  });
+
+  it("清理历史重复：老版本留下的另一条带 marker 评论被删，最新的那条被认领保留", async () => {
+    const store = makeStore([
+      { id: 10, user: { login: ROBIN_BOT_LOGIN }, body: `${REVIEW_MARKER}\n旧的审查结论` },
+      { id: 11, user: { login: ROBIN_BOT_LOGIN }, body: `${REVIEW_MARKER}\n另一条旧的` },
+    ]);
+    const kept = await resolveStatusCommentId(store.octokit, OWNER, REPO, PR, "review", "model-x");
+    expect(markedRobinComments(store.comments)).toHaveLength(1);
+    // 保留的是**最新**那条（被认领、原地改写），不是重建一条新的。
+    expect(kept).toBe(11);
+    expect(store.comments.some((c) => c.id === 10)).toBe(false);
+  });
+
+  it("三条跑下来仍然恰好一条，且最后一条内容是本轮的", async () => {
+    const store = makeStore();
+    await resolveStatusCommentId(store.octokit, OWNER, REPO, PR, "review", "model-x");
+    await resolveStatusCommentId(store.octokit, OWNER, REPO, PR, "summary", "model-y");
+    await resolveStatusCommentId(store.octokit, OWNER, REPO, PR, "review", "model-z");
+    expect(markedRobinComments(store.comments)).toHaveLength(1);
+    expect(markedRobinComments(store.comments)[0].body).toContain("model-z");
+  });
+});
+
+describe("接线（源码扫描）：仍然只有顺序这件事需要扫描", () => {
+  const src = readFileSync(join(__dirname, "main.ts"), "utf8");
+
   it("清理发生在读 hop 之前 —— 顺序本身就是 R1077 那条链的前提", () => {
-    // 不钉住顺序 someday 有人把清理挪到失败路径之后，链就断了而所有单测仍绿。
+    // keepId 传什么已经由上面的行为测试覆盖了（升级后的部分）；
+    // 但「先清理、后读 hop」这个**跨函数顺序**仍是 main.ts 的内部事实，只能扫描。
+    // 不钉住顺序 someday 有人把 resolveStatusCommentId 挪到失败路径之后，链就断了。
     const resolveAt = src.indexOf("statusCommentId = await resolveStatusCommentId(");
     const relaunchAt = src.indexOf("maybeRelaunchOnEgressFailure(");
     expect(resolveAt).toBeGreaterThan(-1);
     expect(relaunchAt).toBeGreaterThan(-1);
     expect(resolveAt).toBeLessThan(relaunchAt);
+  });
+
+  it("编排函数已从 main.ts 搬出，不再是模块私有的", () => {
+    // 防回退：这三段代码一旦被搬回 main.ts，上面那些行为测试就又变成测不到生产代码了。
+    expect(src).not.toMatch(/^async function (postStatusComment|updateStatusComment|resolveStatusCommentId)\(/m);
+    expect(src).toMatch(/resolveStatusCommentId,/);
   });
 });
