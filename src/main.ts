@@ -5,7 +5,7 @@ import {
   buildReasoningFallbackNotice,
   ReasoningFallbackReason,
 } from "./reasoning-fallback";
-import { GitUtils } from "./git-utils";
+import { GitUtils, isMissingFileError } from "./git-utils";
 import { ReviewParser, StructuredReview } from "./review-parser";
 import { shouldRetryStructuredReview } from "./review-retry";
 import { GitHubReviewer, ROBIN_SIGNATURE } from "./github-reviewer";
@@ -873,7 +873,20 @@ async function loadRepoConfig(
     core.info(`Loaded repo config from ${filePath}`);
     return parseRepoConfigYaml(fileContent);
   } catch (error) {
-    core.info(`No repo config at ${filePath} (${error})`);
+    // 区分两种失败（R1087）：**文件本来就没有**是正常情况（大多数仓库没有
+    // .github/robin.yml），走默认；**真的取不到**（token 无效 / 限流 / 5xx / 网络抖动）
+    // 则意味着用户的配置被静默忽略了，必须让他看见。
+    // 修之前 `getFileContent` 把两者都压成 `""`，这个 catch 对取文件这一步
+    // **永远进不去** —— 用户只看到一句 "No repo config at …"，看不出是真没配还是取不到。
+    const detail = `${filePath}: ${errorMessage(error)}`;
+    if (isMissingFileError(error)) {
+      core.info(`No repo config at ${detail} (file not found); using defaults.`);
+    } else {
+      core.warning(
+        `Could not load repo config at ${detail}; using defaults. ` +
+          `Check the token's permissions and the Actions rate limit.`,
+      );
+    }
     return {};
   }
 }
@@ -914,7 +927,14 @@ async function loadReviewInstructions(
       instructions.push(`Instructions from ${filePath}:\n${fileInstructions.trim()}`);
     }
   } catch (error) {
-    core.warning(`Could not load review instructions from ${filePath}: ${error}`);
+    // 这里的 catch 之前**只对 pulls.get 生效**：取 instructions 文件的失败被
+    // getFileContent 吞成 ""，一个字都不说（同函数里两种失败一种报一种不报）。
+    // 走到 fetch 只可能是用户**显式**配了 instructions-file（为空在上面就返回了），
+    // 所以无论 404 还是 403 都值得 warning。
+    core.warning(
+      `Could not load review instructions from ${filePath}: ${errorMessage(error)}. ` +
+        `Review will run without them.`,
+    );
   }
 
   return instructions.join("\n\n");
