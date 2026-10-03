@@ -38,6 +38,12 @@ jobs:
       - name: Rerun Robin
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # R1096：本 job 没有 actions/checkout，工作区**不是** git 仓库。
+          # `gh` 只有在 git remote 或 `GH_REPO` 里才能得知仓库；`GITHUB_REPOSITORY`
+          # **不会被 gh 读取**（实测：非 git 目录下只设 GITHUB_REPOSITORY，
+          # gh 报 `failed to determine base repo`）。没有这一行，rerun 从不发生，
+          # 整个自动重启形同虚设。
+          GH_REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -euo pipefail
