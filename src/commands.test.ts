@@ -1,4 +1,9 @@
-import { AVAILABLE_COMMANDS, hasRequiredPermission, parseSlashCommand } from "./commands";
+import {
+  AVAILABLE_COMMANDS,
+  hasRequiredPermission,
+  parseSlashCommand,
+  resolveMinCommandPermission,
+} from "./commands";
 import { getHelpMessage } from "./prompts/review-prompts";
 
 describe("parseSlashCommand", () => {
@@ -28,6 +33,52 @@ describe("hasRequiredPermission", () => {
     expect(hasRequiredPermission("triage", "write")).toBe(false);
     expect(hasRequiredPermission("read", "triage")).toBe(false);
     expect(hasRequiredPermission("none", "read")).toBe(false);
+  });
+
+  // R1090：授权门禁必须 fail-closed。此前 minimum 未知时兜底是 `write`，
+  // 于是 `"admin "`（尾随空格）或 `admim`（拼错）会把只该 admin 触发的仓库
+  // **静默放开给 write 用户** —— 方向刚好反了。这条是当时的探针，留作回归钉子。
+  it("未知 minimum 不得把门槛放宽（fail-closed 到最严）", () => {
+    expect(hasRequiredPermission("write", "admin ")).toBe(false);
+    expect(hasRequiredPermission("write", "admim")).toBe(false);
+    expect(hasRequiredPermission("maintain", "admim")).toBe(false);
+    // 最严的 admin 仍然可以通过 —— 门禁只收紧、不误伤最高权限。
+    expect(hasRequiredPermission("admin", "admim")).toBe(true);
+  });
+
+  it("未知的用户权限一律拒绝（fail-closed）", () => {
+    // 未知用户 → 按 none(0) 计；只要 minimum 比 none 严就拒绝。
+    expect(hasRequiredPermission("", "read")).toBe(false);
+    expect(hasRequiredPermission("owner", "read")).toBe(false);
+    expect(hasRequiredPermission("WRITE", "write")).toBe(true); // 大小写不敏感
+    // `minimum: none` 的语义就是「谁都能触发」，此时放行未知用户并不违反
+    // fail-closed —— 门禁本来就是开着的。这条把该语义钉住，免得日后误删。
+    expect(hasRequiredPermission("", "none")).toBe(true);
+    expect(hasRequiredPermission("owner", "none")).toBe(true);
+  });
+});
+
+describe("resolveMinCommandPermission", () => {
+  it("空 / 纯空白 = 没配：用文档默认 write，且不告警", () => {
+    expect(resolveMinCommandPermission("")).toEqual({ value: "write", valid: true });
+    expect(resolveMinCommandPermission("   ")).toEqual({ value: "write", valid: true });
+  });
+
+  it("已知等级归一化大小写与首尾空白", () => {
+    expect(resolveMinCommandPermission("ADMIN")).toEqual({ value: "admin", valid: true });
+    expect(resolveMinCommandPermission(" maintain ")).toEqual({ value: "maintain", valid: true });
+    expect(resolveMinCommandPermission("none")).toEqual({ value: "none", valid: true });
+    // 尾随空格是 YAML 里极常见的手滑：**trim 之后它是合法的 admin**，
+    // 不能因为空格被当成未知值而降级成 write（旧实现就是那样）。
+    expect(resolveMinCommandPermission("admin ")).toEqual({ value: "admin", valid: true });
+  });
+
+  it("未知值 → 最严的 admin + valid:false（让调用方能告警）", () => {
+    expect(resolveMinCommandPermission("admim")).toEqual({ value: "admin", valid: false });
+    expect(resolveMinCommandPermission("owner")).toEqual({ value: "admin", valid: false });
+    // 原型链上的键不能被当成合法等级（`in` 会中招，所以用 hasOwnProperty）。
+    expect(resolveMinCommandPermission("constructor")).toEqual({ value: "admin", valid: false });
+    expect(resolveMinCommandPermission("toString")).toEqual({ value: "admin", valid: false });
   });
 });
 

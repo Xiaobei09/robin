@@ -343,4 +343,23 @@ describe("接线（源码扫描）：main.ts 里无法单测的契约", () => {
     expect(gBody).toMatch(/try \{[\s\S]*await paginate\.call\(/);
     expect(fnSegment("listIssueCommentBodies")).toMatch(/try \{[\s\S]*await octokit\.paginate\(/);
   });
+
+  it("min-command-permission 必经解析器且对非法值告警，不得静默回退（R1090）", () => {
+    // 曾经是 `core.getInput("min-command-permission") || "write"`：非法值
+    // （尾随空格 / 拼错）会静默降级成 write，把授权门禁**放宽**。
+    expect(src).not.toMatch(/getInput\("min-command-permission"\)\s*\|\|\s*"write"/);
+
+    const anchor = src.indexOf('getInput("min-command-permission")');
+    expect(anchor).toBeGreaterThan(-1);
+    // 按**下一个语句的锚点**切，不用固定字符窗 —— 窗宽够不到时会把
+    // "锚点存在但片段不够长"伪装成断言失败（R1087/R1088 踩过）。
+    const boundary = src.indexOf('getBooleanInput("review-on-synchronize")', anchor);
+    expect(boundary).toBeGreaterThan(anchor);
+    const seg = src.slice(anchor, boundary);
+
+    // 取到的值要交给解析器，且非法时要告警（不能只解析、不吭声）。
+    expect(seg).toMatch(/resolveMinCommandPermission\(/);
+    expect(seg).toMatch(/core\.warning\(/);
+    expect(seg).toMatch(/minCommandPermissionValid/);
+  });
 });

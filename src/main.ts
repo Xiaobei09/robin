@@ -42,7 +42,7 @@ import {
   resolveRequestChanges,
 } from "./repo-config";
 import { getReviewPrompt, getSummaryPrompt, getHelpMessage } from "./prompts/review-prompts";
-import { ReviewerCommand, hasRequiredPermission, parseSlashCommand } from "./commands";
+import { ReviewerCommand, hasRequiredPermission, parseSlashCommand, resolveMinCommandPermission, PERMISSION_LEVELS } from "./commands";
 import {
   isGithubActionsToken,
   planRelaunch,
@@ -76,7 +76,19 @@ async function run(): Promise<void> {
     const token = core.getInput("github-token", { required: true });
     octokit = github.getOctokit(token);
     relaunchGithubToken = token;
-    const minCommandPermission = core.getInput("min-command-permission") || "write";
+    const rawMinCommandPermission = core.getInput("min-command-permission");
+    const {
+      value: minCommandPermission,
+      valid: minCommandPermissionValid,
+    } = resolveMinCommandPermission(rawMinCommandPermission);
+    if (!minCommandPermissionValid) {
+      // 不要默默用兜底值：这是授权门禁，拼错必须可见。
+      core.warning(
+        `Invalid min-command-permission "${rawMinCommandPermission}"; expected one of ` +
+          `${PERMISSION_LEVELS.join(", ")}. Falling back to "admin" (the most restrictive ` +
+          `level) so a typo cannot silently widen who can run slash commands.`
+      );
+    }
     const reviewOnSynchronize = core.getBooleanInput("review-on-synchronize");
 
     core.info(`Event: ${eventName}`);

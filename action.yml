@@ -69,7 +69,7 @@ inputs:
     required: false
     default: "false"
   min-command-permission:
-    description: "Minimum repository permission required to run slash commands: read, triage, write, maintain, or admin."
+    description: "Minimum repository permission required to run slash commands: none, read, triage, write, maintain, or admin."
     required: false
     default: "write"
   review-instructions:

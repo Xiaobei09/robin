@@ -7,7 +7,8 @@
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.AVAILABLE_COMMANDS = void 0;
+exports.DEFAULT_MIN_COMMAND_PERMISSION = exports.PERMISSION_LEVELS = exports.AVAILABLE_COMMANDS = void 0;
+exports.resolveMinCommandPermission = resolveMinCommandPermission;
 exports.parseSlashCommand = parseSlashCommand;
 exports.hasRequiredPermission = hasRequiredPermission;
 /**
@@ -40,6 +41,10 @@ const COMMAND_LOOKUP = new Map(exports.AVAILABLE_COMMANDS.map((entry) => [entry.
  * （否则 `review` 后面紧跟 `i`，不满足 terminator，正则回溯后整体不匹配）。
  */
 const SLASH_COMMAND_PATTERN = new RegExp(`^/(${Array.from(COMMAND_LOOKUP.keys()).map(escapeRegExp).join("|")})(?:\\s|$)`, "i");
+/**
+ * 权限等级 → 数值。**这里是「有哪些等级、谁高谁低」的唯一真相来源。**
+ * `PermissionLevel` 从它派生，避免 union 与映射各改各的。
+ */
 const PERMISSION_RANK = {
     none: 0,
     read: 1,
@@ -48,6 +53,30 @@ const PERMISSION_RANK = {
     maintain: 4,
     admin: 5,
 };
+/** 用于告警文案的可选值列表，同样派生自映射。 */
+exports.PERMISSION_LEVELS = Object.keys(PERMISSION_RANK);
+/** 授权门禁的默认最低权限；action.yml / review.yml 的 default 都是 "write"。 */
+exports.DEFAULT_MIN_COMMAND_PERMISSION = "write";
+const isPermissionLevel = (value) => Object.prototype.hasOwnProperty.call(PERMISSION_RANK, value);
+/**
+ * 归一化并校验 `min-command-permission` 输入。
+ *
+ * 返回 `{ value, valid }` 而不是单个字符串，是为了让调用方能**告警**，
+ * 而不是默默使用兜底值。未知值的兜底是**最严的 admin**，不是默认的 write：
+ * 这是一个授权门禁，`"admin "`（尾随空格）或 `admim`（拼错）若退化成 write，
+ * 会把只该 admin 触发的仓库**静默放开给 write 用户** —— 方向刚好反了。
+ *
+ * 空字符串是唯一例外：它表示「没配」，用默认 write，且 `valid: true`（不该告警），
+ * 与 `core.getInput(...) || "write"` 的历史语义一致。
+ */
+function resolveMinCommandPermission(input) {
+    const normalized = input.trim().toLowerCase();
+    if (normalized === "")
+        return { value: exports.DEFAULT_MIN_COMMAND_PERMISSION, valid: true };
+    if (isPermissionLevel(normalized))
+        return { value: normalized, valid: true };
+    return { value: "admin", valid: false };
+}
 function parseSlashCommand(commentBody) {
     const firstLine = commentBody
         .split("\n")
@@ -61,8 +90,15 @@ function parseSlashCommand(commentBody) {
     return COMMAND_LOOKUP.get(match[1].toLowerCase());
 }
 function hasRequiredPermission(permission, minimumPermission) {
-    const userRank = PERMISSION_RANK[permission.toLowerCase()] ?? 0;
-    const requiredRank = PERMISSION_RANK[minimumPermission.toLowerCase()] ?? PERMISSION_RANK.write;
+    const user = permission.toLowerCase();
+    const minimum = minimumPermission.toLowerCase();
+    // 用户侧未知权限 → 0（none）⇒ 拒绝，fail-closed。
+    const userRank = isPermissionLevel(user) ? PERMISSION_RANK[user] : 0;
+    // minimum 侧未知 → 最严的 admin ⇒ 拒绝。绝**不**回退到 write：
+    // 拼错/尾随空格只能让门禁更严，不能让它更松（见 resolveMinCommandPermission）。
+    const requiredRank = isPermissionLevel(minimum)
+        ? PERMISSION_RANK[minimum]
+        : PERMISSION_RANK.admin;
     return userRank >= requiredRank;
 }
 //# sourceMappingURL=commands.js.map
@@ -1800,7 +1836,14 @@ async function run() {
         const token = core.getInput("github-token", { required: true });
         octokit = github.getOctokit(token);
         relaunchGithubToken = token;
-        const minCommandPermission = core.getInput("min-command-permission") || "write";
+        const rawMinCommandPermission = core.getInput("min-command-permission");
+        const { value: minCommandPermission, valid: minCommandPermissionValid, } = (0, commands_1.resolveMinCommandPermission)(rawMinCommandPermission);
+        if (!minCommandPermissionValid) {
+            // 不要默默用兜底值：这是授权门禁，拼错必须可见。
+            core.warning(`Invalid min-command-permission "${rawMinCommandPermission}"; expected one of ` +
+                `${commands_1.PERMISSION_LEVELS.join(", ")}. Falling back to "admin" (the most restrictive ` +
+                `level) so a typo cannot silently widen who can run slash commands.`);
+        }
         const reviewOnSynchronize = core.getBooleanInput("review-on-synchronize");
         core.info(`Event: ${eventName}`);
         const owner = github.context.repo.owner;
