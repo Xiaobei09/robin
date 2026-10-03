@@ -254,8 +254,20 @@ describe("resolveStatusCommentId：从源码扫描升级为行为测试（R1081�
   });
 });
 
-describe("接线（源码扫描）：仍然只有顺序这件事需要扫描", () => {
+describe("接线（源码扫描）：main.ts 里无法单测的契约", () => {
   const src = readFileSync(join(__dirname, "main.ts"), "utf8");
+
+  /**
+   * 按**下一个函数声明**切片，而不是按固定字符数 —— 固定字符数够不到函数末尾时
+   * 会让「锚点存在但片段不够长」伪装成一条莫名其妙的断言失败（R1087 踩过）。
+   */
+  function fnSegment(name: string): string {
+    const start = src.indexOf(`async function ${name}(`);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const rest = src.slice(start + 1);
+    const next = rest.search(/\n(?:async )?function [A-Za-z]/);
+    return next === -1 ? rest : rest.slice(0, next);
+  }
 
   it("清理发生在读 hop 之前 —— 顺序本身就是 R1077 那条链的前提", () => {
     // keepId 传什么已经由上面的行为测试覆盖了（升级后的部分）；
@@ -272,5 +284,63 @@ describe("接线（源码扫描）：仍然只有顺序这件事需要扫描", (
     // 防回退：这三段代码一旦被搬回 main.ts，上面那些行为测试就又变成测不到生产代码了。
     expect(src).not.toMatch(/^async function (postStatusComment|updateStatusComment|resolveStatusCommentId)\(/m);
     expect(src).toMatch(/resolveStatusCommentId,/);
+  });
+
+  /**
+   * R1088：`listIssueCommentBodies` 的注释承诺「列不出来就当没有历史 ⇒ 最坏是多重启
+   * 一次」，但**没有 try/catch** ⇒ `paginate` 抛错时整条重启评论都不发。
+   *
+   * 这条只能扫描：`listIssueCommentBodies` 是 main.ts 的模块私有函数，import 即执行。
+   * 而它确实是本轮的核心契约（链的"降级方向"），不是可有可无的接线。
+   */
+  it("读历史失败要降级（当没有历史），不能把整条重启放弃", () => {
+    const seg = fnSegment("listIssueCommentBodies");
+
+    const paginateAt = seg.indexOf("await octokit.paginate(");
+    expect(paginateAt).toBeGreaterThan(-1);
+    // paginate 必须在 try 里。用 lastIndexOf 找它之前最近的 try {。
+    const tryAt = seg.lastIndexOf("try {", paginateAt);
+    expect(tryAt).toBeGreaterThan(-1);
+    expect(tryAt).toBeLessThan(paginateAt);
+
+    // catch 必须在 paginate 之后。**只取花括号内的 catch 体**：
+    // 用固定字符窗口会被后面**另一处** `return [];`
+    // （`if (!Array.isArray(comments)) return [];`）满足 —— R1088 的 T2 变异
+    // （把 catch 里的 return [] 改成 throw）就是这样**存活**下来的。
+    // 判据固化：扫描一段代码要按结构边界取，不能按字符数取。
+    const catchAt = seg.indexOf("} catch (error) {", paginateAt);
+    expect(catchAt).toBeGreaterThan(paginateAt);
+    const open = seg.indexOf("{", catchAt);
+    let depth = 0;
+    let end = -1;
+    for (let i = open; i < seg.length; i++) {
+      if (seg[i] === "{") depth++;
+      else if (seg[i] === "}") {
+        depth--;
+        if (depth === 0) {
+          end = i;
+          break;
+        }
+      }
+    }
+    expect(end).toBeGreaterThan(open);
+    const body = seg.slice(open + 1, end);
+
+    // 必须 return []（= hop 0），而不是继续往上抛 ⇒ 整条重启被放弃
+    expect(body).toContain("return [];");
+    // 降级要留痕，否则一次持续的 403 会让"为什么不重启"完全不可见
+    expect(body).toContain("core.warning");
+  });
+
+  it("它与兄弟实现 findExistingReviewComment 不再差一个 catch（R1088）", () => {
+    // 两份实现逐行相同（paginate + listComments + per_page 100 + Array.isArray），
+    // 修之前只有 github-reviewer 那份有 try/catch。钉住"都有"。
+    const reviewer = readFileSync(join(__dirname, "github-reviewer.ts"), "utf8");
+    const gSeg = reviewer.slice(
+      reviewer.indexOf("export async function findExistingReviewComment(")
+    );
+    const gBody = gSeg.slice(0, gSeg.indexOf("\nexport "));
+    expect(gBody).toMatch(/try \{[\s\S]*await paginate\.call\(/);
+    expect(fnSegment("listIssueCommentBodies")).toMatch(/try \{[\s\S]*await octokit\.paginate\(/);
   });
 });

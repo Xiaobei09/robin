@@ -2181,12 +2181,27 @@ async function listIssueCommentBodies(octokit, owner, repo, issueNumber) {
     const listComments = octokit?.rest?.issues?.listComments;
     if (typeof octokit?.paginate !== "function" || !listComments)
         return [];
-    const comments = await octokit.paginate(listComments, {
-        owner,
-        repo,
-        issue_number: issueNumber,
-        per_page: 100,
-    });
+    // 这个 catch 是上面那段契约的**全部实现**（R1088）。没有它时，
+    // `octokit.paginate` 一旦抛错（403 限流/权限、5xx、网络抖动）就会一路冒到
+    // `maybeRelaunchOnEgressFailure` 的 catch —— 而那条 catch 的语义是「整条重启评论
+    // 都不发了」，与注释承诺的「列不出来就当没有历史 ⇒ 最坏是多重启一次」**正好相反**。
+    // 也就是说：**读历史失败会让这次重启被整个放弃**，而不是降级。
+    // 兄弟函数 `findExistingReviewComment`（github-reviewer.ts:83）本来就有这个 catch，
+    // 两份实现逐行相同、只差这一个 —— 这条不对称是本轮唯一的问题。
+    let comments;
+    try {
+        comments = await octokit.paginate(listComments, {
+            owner,
+            repo,
+            issue_number: issueNumber,
+            per_page: 100,
+        });
+    }
+    catch (error) {
+        core.warning(`Could not list issue comments while checking relaunch history: ${(0, llm_retry_1.errorMessage)(error)}. ` +
+            `Assuming no prior relaunch comment.`);
+        return [];
+    }
     if (!Array.isArray(comments))
         return [];
     return comments
