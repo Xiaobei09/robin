@@ -7,6 +7,8 @@ import {
   findExistingReviewComment,
   publishRobinComment,
 } from "./github-reviewer";
+import { readFileSync } from "fs";
+import { join } from "path";
 
 /** Minimal stand-in for the octokit surface the comment helpers touch. */
 function fakeOctokit(comments: any[], opts: { throwOnPaginate?: boolean } = {}) {
@@ -140,7 +142,7 @@ describe("publishRobinComment", () => {
 });
 
 describe("deletePreviousReviewComments", () => {
-  it("removes other bot comments and keeps the kept one", async () => {
+  it("removes Robin's other *marked* comments and keeps the kept one", async () => {
     const octokit = fakeOctokit([marked(1), marked(2), marked(3)]);
     expect(await deletePreviousReviewComments(octokit, "o", "r", 1, 2)).toBe(2);
     expect(octokit.deleteComment.mock.calls.map((c: any[]) => c[0].comment_id)).toEqual([1, 3]);
@@ -155,6 +157,69 @@ describe("deletePreviousReviewComments", () => {
   it("is a no-op when listing fails", async () => {
     const octokit = fakeOctokit([], { throwOnPaginate: true });
     expect(await deletePreviousReviewComments(octokit, "o", "r", 1, 2)).toBe(0);
+  });
+
+  /**
+   * R1077：只判作者会把消费仓里**任何**用默认 token 发评论的工具连坐掉。
+   *
+   * 这三条是本轮加的判据（带 marker + 作者 + 非 keepId）。关键在第一条 ——
+   * 作者是 `github-actions[bot]` 并不等于「这是 Robin 发的评论」：
+   * 覆盖率机器人、stale-action 清理、任何辅助脚本，只要用 `${{ github.token }}`
+   * 调 `createComment`，作者就都是这个 bot。
+   */
+  describe("R1077：作者是 bot 不等于这条评论属于 Robin", () => {
+    it("别处用默认 token 发的 bot 评论不被删（覆盖率/清理类工具）", async () => {
+      const octokit = fakeOctokit([
+        marked(2),
+        { id: 7, user: { login: ROBIN_BOT_LOGIN }, body: "coverage: 91.2% (0 changed)" },
+      ]);
+      expect(await deletePreviousReviewComments(octokit, "o", "r", 1, 2)).toBe(0);
+      expect(octokit.deleteComment).not.toHaveBeenCalled();
+    });
+
+    it("relaunch 评论（另一种 marker）不被删 —— 它是 hop 的唯一记账载体", async () => {
+      // 删掉它 ⇒ readPreviousHop 读回 0 ⇒ 额度重置。这条是 hop 护栏与评论去重
+      // 两个功能之间的那条连线，之前没有任何测试跨越过它。
+      const octokit = fakeOctokit([
+        marked(2),
+        { id: 8, user: { login: ROBIN_BOT_LOGIN }, body: "/robin\n\n<!-- robin:relaunch -->\nhop=1 of 2" },
+      ]);
+      expect(await deletePreviousReviewComments(octokit, "o", "r", 1, 2)).toBe(0);
+      expect(octokit.deleteComment).not.toHaveBeenCalled();
+    });
+
+    it("老版本 Robin 评论（legacy marker、无新 marker）不被删", async () => {
+      // 删掉它不会丢功能性内容，但会让一次 review 平白丢掉上一轮的可见结论；
+      // 保守起见只删自己能认领的。
+      const octokit = fakeOctokit([
+        marked(2),
+        { id: 9, user: { login: ROBIN_BOT_LOGIN }, body: "<!-- robin:status -->\n审查中" },
+      ]);
+      expect(await deletePreviousReviewComments(octokit, "o", "r", 1, 2)).toBe(0);
+      expect(octokit.deleteComment).not.toHaveBeenCalled();
+    });
+
+    it("作者 + marker 都对才删 —— 三条判据缺一不可", async () => {
+      const octokit = fakeOctokit([
+        marked(2), // keepId，留着
+        marked(3), // 作者 + marker + 非 keepId ⇒ 删
+        marked(4, "octocat"), // marker 但作者是人 ⇒ 不删
+        { id: 5, user: { login: ROBIN_BOT_LOGIN }, body: "无 marker 的 bot 评论" }, // 作者但无 marker ⇒ 不删
+      ]);
+      expect(await deletePreviousReviewComments(octokit, "o", "r", 1, 2)).toBe(1);
+      expect(octokit.deleteComment.mock.calls.map((c: any[]) => c[0].comment_id)).toEqual([3]);
+    });
+
+    it("与查找路径共用同一份 marker 判据，不会出现「找得到但删不掉」", async () => {
+      // R929/M17：两处各写一份判据就会分叉。钉住清理用的是 includes(REVIEW_MARKER)。
+      const src = readFileSync(join(__dirname, "github-reviewer.ts"), "utf8");
+      const start = src.indexOf("export async function deletePreviousReviewComments(");
+      expect(start).toBeGreaterThan(-1);
+      const body = src.slice(start, src.indexOf("\n}\n", start));
+      expect(body).toContain("comment.body.includes(REVIEW_MARKER)");
+      // 顺序：先便宜的身份判断，再读正文；marker 缺失时直接跳过，不进删除分支。
+      expect(body).toContain("!comment.body.includes(REVIEW_MARKER)) continue;");
+    });
   });
 });
 

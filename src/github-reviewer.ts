@@ -160,9 +160,22 @@ export async function publishRobinComment(
 /**
  * Delete Robin's *other* marked comments, keeping `keepId`.
  *
- * Only pre-existing duplicates are removed — comments authored by a human are
- * never touched, and a single failure to delete one is logged and skipped so a
- * cleanup problem can never fail a review.
+ * **判据必须同时满足三条：带 marker + 作者是 bot + 不是 `keepId`。**
+ *
+ * 为什么 marker 这条不能少（R1077）：只判作者会删掉 PR 上**任何**其它
+ * `github-actions[bot]` 评论，包括跟 Robin 毫无关系的 —— 消费仓里任何一个用默认
+ * token 调 `createComment` 的工具（覆盖率机器人、stale 清理、辅助脚本）发的东西，
+ * 都会在每次 review 开始时被静默删掉，且不可恢复。而函数名承诺的是「删除上一轮的
+ * **review** 评论」，实现比承诺宽。
+ *
+ * 之前只判作者，是因为这个函数和 marker 判据是同一次改动（R1067）里加进来的，
+ * 而 marker 只被用在了查找路径上。R1068 给 status 的 legacy 回退补了作者校验，
+ * 却没人回头看清理路径 —— 「只补了一半」比「漏了」更难发现，因为两处都存在。
+ *
+ * marker 判据复用 `findExistingReviewComment` 的同一份（`includes(REVIEW_MARKER)`），
+ * 不另写一份：两处一旦分叉，就会出现「找得到但删不掉」或反之的诡异状态。
+ *
+ * 单条删除失败只记日志并跳过 —— 清理问题永远不该让一次 review 失败。
  */
 export async function deletePreviousReviewComments(
   octokit: unknown,
@@ -183,7 +196,7 @@ export async function deletePreviousReviewComments(
       repo,
       issue_number: issueNumber,
       per_page: 100,
-    })) as Array<{ id?: unknown; user?: { login?: unknown } | null }>;
+    })) as Array<{ id?: unknown; body?: unknown; user?: { login?: unknown } | null }>;
     if (!Array.isArray(comments)) return 0;
 
     let deleted = 0;
@@ -191,6 +204,7 @@ export async function deletePreviousReviewComments(
       const id = Number(comment?.id);
       if (!Number.isFinite(id) || id === keepId) continue;
       if (comment?.user?.login !== ROBIN_BOT_LOGIN) continue;
+      if (typeof comment?.body !== "string" || !comment.body.includes(REVIEW_MARKER)) continue;
       try {
         await (deleteComment as Function).call(octokit, {
           owner,

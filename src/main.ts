@@ -724,8 +724,10 @@ async function updateStatusComment(
  *
  * Whichever branch it takes, it then drops Robin's *other* marked comments. Those only exist
  * on PRs reviewed before the marker was unified, but leaving them behind is exactly the
- * pile-up this function exists to remove — and it can only ever touch comments authored by
- * `github-actions[bot]`, never a human's.
+ * pile-up this function exists to remove. The cleanup requires all three of "carries the
+ * marker", "authored by `github-actions[bot]`" and "is not the comment we just kept" —
+ * the author check alone would reach unrelated comments from any other tool in the consumer
+ * repo that comments as the default token (R1077).
  */
 async function resolveStatusCommentId(
   octokit: any,
