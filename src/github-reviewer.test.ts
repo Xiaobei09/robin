@@ -306,6 +306,72 @@ describe("GitHubReviewer", () => {
     expect(isLineInNewDiff(patch, 99)).toBe(false);
   });
 
+  /**
+   * R1083：`isLineInNewDiff` 是决定**任何** finding 能否内联的那道闸门。
+   * 放行一个不存在的行号，GitHub 会对整条 review 报 422，而 `postReview` 的兜底是
+   * **去掉全部内联评论**改成纯 summary 重发 —— 也就是说一条幻觉行号的代价是
+   * 这一轮所有内联定位一起消失（这是实测过的调用链，不是推测）。
+   *
+   * 此前这里只有 4 条断言、只覆盖**一种 patch 形状**（单 hunk）。
+   * 下面把后果方向上真正会错的形状逐个钉住。
+   *
+   * **所有期望值都是先 probe 实测、确认与 git 语义一致之后才写下来的**，
+   * 不是照着实现推的 —— 否则就成了「用测试固化我以为的行为」。
+   */
+  describe("isLineInNewDiff：后果方向的形状覆盖", () => {
+    const reviewer = new GitHubReviewer({} as any);
+    const isLineInNewDiff = (patch: string, line: number): boolean =>
+      (reviewer as any).isLineInNewDiff(patch, line);
+
+    it("多 hunk：每个 @@ 重置计数器，hunk 之间的行不属于任何 hunk", () => {
+      // 新侧：hunk1 覆盖 1..3，hunk2 覆盖 10..12
+      const patch = [
+        "@@ -1,2 +1,3 @@",
+        " a",
+        "+b",
+        " c",
+        "@@ -10,2 +10,3 @@",
+        " d",
+        "+e",
+        " f",
+      ].join("\n");
+
+      for (const n of [1, 2, 3, 10, 11, 12]) expect(isLineInNewDiff(patch, n)).toBe(true);
+      // 4..9 是两个 hunk 之间的**真实文件行**，但不在 diff 里 ⇒ GitHub 不接受评论
+      for (const n of [4, 9, 13]) expect(isLineInNewDiff(patch, n)).toBe(false);
+    });
+
+    it("删除行不占新文件号（否则其后所有行号整体错位一位）", () => {
+      const patch = ["@@ -1,3 +1,3 @@", " ctx", "-old", "+new", " ctx2"].join("\n");
+      expect(isLineInNewDiff(patch, 1)).toBe(true); // ctx
+      expect(isLineInNewDiff(patch, 2)).toBe(true); // +new —— 若是 3 就说明删除行占了号
+      expect(isLineInNewDiff(patch, 3)).toBe(true); // ctx2
+      expect(isLineInNewDiff(patch, 4)).toBe(false);
+    });
+
+    it("No-newline 标记不被当成上下文行", () => {
+      // 那行以反斜杠开头。若被误当上下文行，它会白占一个号，
+      // 于是「文件最后一行 + 1」这个幻觉行号会被放行。
+      const patch = ["@@ -1,1 +1,1 @@", "-a", "+b", "\\ No newline at end of file"].join("\n");
+      expect(isLineInNewDiff(patch, 1)).toBe(true);
+      expect(isLineInNewDiff(patch, 2)).toBe(false);
+    });
+
+    it("删除文件（+0,0）任何行都不可评论", () => {
+      const patch = ["@@ -1,2 +0,0 @@", "-a", "-b"].join("\n");
+      for (const n of [0, 1, 2]) expect(isLineInNewDiff(patch, n)).toBe(false);
+    });
+
+    it("边界：空 patch / 0 / 负数 / 小数一律拒绝", () => {
+      const patch = ["@@ -1,1 +1,1 @@", "+b"].join("\n");
+      expect(isLineInNewDiff("", 1)).toBe(false);
+      expect(isLineInNewDiff(patch, 0)).toBe(false);
+      expect(isLineInNewDiff(patch, -5)).toBe(false);
+      // 严格相等 ⇒ 小数永不匹配。这是**保守拒**，符合「宁可漏也不错位」。
+      expect(isLineInNewDiff(patch, 1.5)).toBe(false);
+    });
+  });
+
   it("uses line and side for inline review comments", () => {
     const reviewer = new GitHubReviewer({} as any);
     const buildReviewComments = (reviewer as any).buildReviewComments.bind(reviewer);
