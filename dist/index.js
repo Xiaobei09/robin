@@ -76,6 +76,7 @@ function hasRequiredPermission(permission, minimumPermission) {
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.MAX_LLM_COMPLETION_ATTEMPTS = exports.MIN_LLM_COMPLETION_ATTEMPTS = exports.MAX_LLM_TEMPERATURE = exports.DEFAULT_LLM_TEMPERATURE = exports.DEFAULT_LLM_ROUTER_RETRY_DELAY_MS = exports.DEFAULT_LLM_RETRY_DELAY_MS = exports.DEFAULT_LLM_ROUTER_COMPLETION_ATTEMPTS = exports.DEFAULT_LLM_COMPLETION_ATTEMPTS = exports.DEFAULT_LLM_ROUTER_FIRST_CHUNK_MS = exports.DEFAULT_LLM_ROUTER_TIMEOUT_MS = exports.DEFAULT_LLM_TIMEOUT_MS = void 0;
+exports.parseStrictNumber = parseStrictNumber;
 exports.parseLLMTimeout = parseLLMTimeout;
 exports.parseLLMTemperature = parseLLMTemperature;
 exports.parseLLMMaxAttempts = parseLLMMaxAttempts;
@@ -89,11 +90,35 @@ exports.DEFAULT_LLM_ROUTER_RETRY_DELAY_MS = 3000;
 exports.DEFAULT_LLM_TEMPERATURE = 0.1; // near-deterministic reviews
 /** OpenAI-compatible upper bound; some models (e.g. Kimi) only accept 1. */
 exports.MAX_LLM_TEMPERATURE = 2;
+/**
+ * 严格数字解析：只接受**纯十进制写法**（可选一位小数部分）。
+ *
+ * 为什么不直接用 `Number()`：`Number` 会「照猜的读」而不是拒绝拼写错误 ——
+ * `Number("0x10")=16`、`Number("0b11")=3`、`Number("1e3")=1000`。对 timeout 这种
+ * 参数，那意味着 `llm-timeout-ms: 1e3` 变成 1000 **毫秒**，每次审查必然超时失败，
+ * 而日志里看不出任何异常。`parseInt` 更糟：它把拼写错误**静默变成一个合法但完全
+ * 不同的数**（`parseInt("1e3")=1`、`parseInt("0x10")=0`）。
+ *
+ * 空串必须先拦：`Number("") === 0`。不拦的话「未设置」会被悄悄变成「显式 0」。
+ * 下溢同理：`Number("1e-400") === 0`。
+ *
+ * 小数**允许**（timeout 5000.5ms 虽无意义但无害，且已有测试钉住），
+ * 需要整数的调用方自己加 `Number.isInteger`。
+ */
+function parseStrictNumber(input) {
+    const trimmed = input.trim();
+    if (!/^\d+(\.\d+)?$/.test(trimmed))
+        return { value: Number.NaN, valid: false };
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed))
+        return { value: Number.NaN, valid: false };
+    return { value: parsed, valid: true };
+}
 function parseLLMTimeout(input) {
     if (!input)
         return { value: exports.DEFAULT_LLM_TIMEOUT_MS, valid: true };
-    const parsed = Number(input);
-    if (Number.isFinite(parsed) && parsed > 0) {
+    const { value: parsed, valid } = parseStrictNumber(input);
+    if (valid && parsed > 0) {
         return { value: parsed, valid: true };
     }
     return { value: exports.DEFAULT_LLM_TIMEOUT_MS, valid: false };
@@ -1567,7 +1592,14 @@ async function run() {
         const maxDiffSizeInput = core.getInput("max-diff-size") || String(repo_config_1.DEFAULT_ACTION_MAX_DIFF_SIZE);
         const maxCommentsInput = core.getInput("max-comments") || String(repo_config_1.DEFAULT_MAX_COMMENTS);
         const maxOutputTokensInput = core.getInput("max-output-tokens") || "";
-        const maxOutputTokens = maxOutputTokensInput ? parseInt(maxOutputTokensInput, 10) : undefined;
+        // 同一个 parseInt 陷阱的第三例：parseInt("1e3") = 1，而 llm-client 只查
+        // `> 0`，于是 1 会通过 ⇒ 模型被限到 1 个 token，审查输出几乎必然为空。
+        const maxOutputTokensParsed = (0, config_1.parseStrictNumber)(maxOutputTokensInput);
+        const maxOutputTokensValid = maxOutputTokensParsed.valid && Number.isInteger(maxOutputTokensParsed.value);
+        if (maxOutputTokensInput && !maxOutputTokensValid) {
+            core.warning(`Invalid max-output-tokens value "${maxOutputTokensInput}", ignoring it`);
+        }
+        const maxOutputTokens = maxOutputTokensInput && maxOutputTokensValid ? maxOutputTokensParsed.value : undefined;
         const reasoningEffortInput = core.getInput("reasoning-effort") || "";
         const llmTimeoutMsInput = core.getInput("llm-timeout-ms") || "";
         const { value: llmTimeoutMs, valid: llmTimeoutValid } = (0, config_1.parseLLMTimeout)(llmTimeoutMsInput);
@@ -1626,8 +1658,14 @@ async function run() {
         const gitUtils = new git_utils_1.GitUtils(octokit);
         const baseRef = payload.pull_request?.base?.sha;
         const repoConfig = await loadRepoConfig(octokit, gitUtils, owner, repo, prNumber, configFile, baseRef);
-        const maxDiffSize = (0, repo_config_1.resolveMaxDiffSize)(maxDiffSizeInput, repoConfig);
-        const maxComments = (0, repo_config_1.resolveMaxComments)(maxCommentsInput, repoConfig);
+        const { value: maxDiffSize, valid: maxDiffSizeValid } = (0, repo_config_1.resolveMaxDiffSize)(maxDiffSizeInput, repoConfig);
+        if (!maxDiffSizeValid) {
+            core.warning(`Invalid max-diff-size value "${maxDiffSizeInput}", using default ${repo_config_1.DEFAULT_ACTION_MAX_DIFF_SIZE}`);
+        }
+        const { value: maxComments, valid: maxCommentsValid } = (0, repo_config_1.resolveMaxComments)(maxCommentsInput, repoConfig);
+        if (!maxCommentsValid) {
+            core.warning(`Invalid max-comments value "${maxCommentsInput}", using default ${repo_config_1.DEFAULT_MAX_COMMENTS}`);
+        }
         const jsonResponseMode = (0, repo_config_1.resolveJsonResponseMode)(jsonResponseModeInput, repoConfig);
         const requestChanges = (0, repo_config_1.resolveRequestChanges)(requestChangesInput, repoConfig);
         const reasoningEffort = (0, repo_config_1.resolveReasoningEffort)(reasoningEffortInput, repoConfig);
@@ -2662,18 +2700,19 @@ function planRelaunch(input) {
 /***/ }),
 
 /***/ 2800:
-/***/ ((__unused_webpack_module, exports) => {
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.DEFAULT_MAX_COMMENTS = exports.DEFAULT_ACTION_MAX_DIFF_SIZE = exports.DEFAULT_CONFIG_FILE = void 0;
 exports.parseRepoConfigYaml = parseRepoConfigYaml;
-exports.resolveMaxDiffSize = resolveMaxDiffSize;
 exports.resolveMaxComments = resolveMaxComments;
+exports.resolveMaxDiffSize = resolveMaxDiffSize;
 exports.resolveJsonResponseMode = resolveJsonResponseMode;
 exports.resolveRequestChanges = resolveRequestChanges;
 exports.resolveReasoningEffort = resolveReasoningEffort;
+const config_1 = __nccwpck_require__(4008);
 exports.DEFAULT_CONFIG_FILE = ".github/robin.yml";
 exports.DEFAULT_ACTION_MAX_DIFF_SIZE = 50000;
 /** Single default shared by action.yml and the reusable review.yml workflow. */
@@ -2759,23 +2798,52 @@ function parseRepoConfigYaml(text) {
     }
     return config;
 }
-function resolveMaxDiffSize(actionInput, repoConfig) {
-    const parsed = parseInt(actionInput, 10);
-    if (repoConfig?.maxDiffSize !== undefined &&
-        Number.isFinite(parsed) &&
-        parsed === exports.DEFAULT_ACTION_MAX_DIFF_SIZE &&
-        repoConfig.maxDiffSize !== exports.DEFAULT_ACTION_MAX_DIFF_SIZE) {
-        return repoConfig.maxDiffSize;
-    }
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : exports.DEFAULT_ACTION_MAX_DIFF_SIZE;
-}
+/**
+ * 解析 `max-comments`。
+ *
+ * 「未设置」的判定是**哨兵**：输入要么没表达出有效意图（空串 / 乱码），要么恰好
+ * 等于默认常量（`action.yml` 与 `review.yml` 会把 default 原样透传下来）。只有这
+ * 两种情况下 `.github/robin.yml` 才能赢 —— 见 `main.ts` 里那两行兜底的注释。
+ *
+ * `valid=false` 表示输入不可用、已回落到默认值；调用方**应当**就此告警，
+ * 否则用户会拿到一个自己没要求过的值而毫无察觉。
+ */
 function resolveMaxComments(actionInput, repoConfig) {
-    const parsed = parseInt(actionInput, 10);
-    const isUnset = Number.isFinite(parsed) && parsed === exports.DEFAULT_MAX_COMMENTS;
+    const { value: raw, valid: parsedOk } = (0, config_1.parseStrictNumber)(actionInput);
+    // 计数没有小数的意义，Math.floor 会把 "1.9" 这类拼写错误藏起来。
+    const valid = parsedOk && Number.isInteger(raw);
+    const parsed = valid ? raw : Number.NaN;
+    const isUnset = !valid || parsed === exports.DEFAULT_MAX_COMMENTS;
     if (repoConfig?.maxComments !== undefined && isUnset) {
-        return repoConfig.maxComments;
+        return { value: repoConfig.maxComments, valid };
     }
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : exports.DEFAULT_MAX_COMMENTS;
+    // 0 是合法值（关掉内联评论），所以用区间而不是真值判断。
+    if (!valid)
+        return { value: exports.DEFAULT_MAX_COMMENTS, valid: false };
+    return { value: parsed >= 0 ? parsed : exports.DEFAULT_MAX_COMMENTS, valid: parsed >= 0 };
+}
+/**
+ * 解析 `max-diff-size`。
+ *
+ * 哨兵语义与 `resolveMaxComments` 相同，外加一条：即使输入等于默认常量，
+ * repo config 自己也等于默认常量时不算「repo 显式配置过」，不必返回。
+ */
+function resolveMaxDiffSize(actionInput, repoConfig) {
+    const { value: raw, valid: parsedOk } = (0, config_1.parseStrictNumber)(actionInput);
+    const valid = parsedOk && Number.isInteger(raw);
+    const parsed = valid ? raw : Number.NaN;
+    const isUnset = !valid ||
+        (parsed === exports.DEFAULT_ACTION_MAX_DIFF_SIZE &&
+            repoConfig?.maxDiffSize !== exports.DEFAULT_ACTION_MAX_DIFF_SIZE);
+    if (repoConfig?.maxDiffSize !== undefined && isUnset) {
+        return { value: repoConfig.maxDiffSize, valid };
+    }
+    if (!valid)
+        return { value: exports.DEFAULT_ACTION_MAX_DIFF_SIZE, valid: false };
+    return {
+        value: parsed > 0 ? parsed : exports.DEFAULT_ACTION_MAX_DIFF_SIZE,
+        valid: parsed > 0,
+    };
 }
 function resolveJsonResponseMode(actionInput, repoConfig) {
     if (actionInput === "true")
